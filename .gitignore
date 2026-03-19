@@ -1,0 +1,49 @@
+# Binaries
+/echo
+/echo.exe
+/echo.exe~
+
+# Go build artifacts
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Go workspace
+go.work
+go.work.sum
+
+.gocache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Node
+node_modules/
+.pnp
+.pnp.js
+
+# Build output
+dist/
+.cache/
+
+# Generated / temp
+*.cjs.tmp
+tmp/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
