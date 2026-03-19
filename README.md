@@ -429,30 +429,11 @@ my-app/
 { "status": "ok", "version": "1.0.0" }
 ```
 
----
-
-## Bundle Caching
-
-| Mode            | ID              | Minified | Source maps | Cache-Control       |
-| --------------- | --------------- | -------- | ----------- | ------------------- |
-| `dev`           | stable key hash | no       | inline      | `no-store`          |
-| `build`/`start` | content hash    | yes      | none        | `immutable, 1 year` |
-
-In dev mode the bundle URL is stable across recompiles so the browser always fetches fresh JS via `no-store`. In production the URL changes when content changes, making `immutable` safe.
-
----
-
 ## JS Runtime
 
 When JS loaders, JS API routes, or the Svelte/Vue compiler plugin are in use, Echo requires Node.js or Bun. **Bun is preferred automatically** when available (~5 ms startup vs ~80 ms for Node). No configuration required — Echo detects whichever runtime is in `PATH`.
 
 If neither is installed, Echo will surface a clear error only when a JS feature is actually invoked. Pure Go projects with no `.loader.ts` files have no runtime dependency.
-
----
-
-## Graceful Shutdown
-
-`echo dev` and `echo start` handle `SIGINT` and `SIGTERM`. In-flight requests are given 10 seconds to complete before the server closes.
 
 ---
 
