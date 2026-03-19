@@ -844,6 +844,7 @@ type BuildOptions struct {
 	// For CLI users the equivalent JS exports in *.loader.ts are used automatically.
 	GoLoaders map[string]LoaderFunc
 	GoPaths   map[string]PathsFunc
+	Plugins   []esbuild.Plugin
 }
 
 // Build compiles all page bundles for appDir (minified, content-hash filenames),
@@ -864,10 +865,14 @@ func Build(appDir string, opts ...BuildOptions) error {
 	if len(opts) > 0 && opts[0].Logger != nil {
 		logger = opts[0].Logger
 	}
+	var userPlugins []esbuild.Plugin
+	if len(opts) > 0 {
+		userPlugins = opts[0].Plugins
+	}
 	buildOpts := bundler.Options{
 		AppDir:  abs,
 		Minify:  true,
-		Plugins: autoPlugins(abs, logger),
+		Plugins: append(userPlugins, autoPlugins(abs, logger)...),
 	}
 	if lc := plugins.FindLightningCSS(abs); lc != "" {
 		logger.Info("CSS: Lightning CSS enabled")

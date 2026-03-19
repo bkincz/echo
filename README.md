@@ -60,7 +60,7 @@ pages/
     [id].tsx
 ```
 
-Layouts receive `children` (React) or use `<slot />` (Svelte) / the default slot (Vue). The layout chain is computed at build time — zero runtime overhead.
+Layouts receive `children` (React) or use `<slot />` (Svelte) / the default slot (Vue). The layout chain is computed at build time, zero runtime overhead.
 
 ```tsx
 // pages/_layout.tsx
@@ -181,7 +181,7 @@ export default function ErrorPage({ loaderData }: { loaderData?: ErrorData }) {
 }
 ```
 
-Panic recovery is applied as the outermost middleware layer — it catches panics anywhere in the request chain.
+Panic recovery is applied as the outermost middleware layer, it catches panics anywhere in the request chain.
 
 ---
 
@@ -228,7 +228,7 @@ export default config;
 echo build ./my-app --static
 ```
 
-Generates a flat `index.html` per route into `dist/`, suitable for any CDN or static host. Loader data is embedded in each file — no server required at runtime.
+Generates a flat `index.html` per route into `dist/`, suitable for any CDN or static host. Loader data is embedded in each file, no server required at runtime.
 
 Dynamic routes require a `paths()` export in their loader file:
 
@@ -431,7 +431,7 @@ my-app/
 
 ## JS Runtime
 
-When JS loaders, JS API routes, or the Svelte/Vue compiler plugin are in use, Echo requires Node.js or Bun. **Bun is preferred automatically** when available (~5 ms startup vs ~80 ms for Node). No configuration required — Echo detects whichever runtime is in `PATH`.
+When JS loaders, JS API routes, or the Svelte/Vue compiler plugin are in use, Echo requires Node.js or Bun. **Bun is preferred automatically** when available (~5 ms startup vs ~80 ms for Node). No configuration required, Echo detects whichever runtime is in `PATH`.
 
 If neither is installed, Echo will surface a clear error only when a JS feature is actually invoked. Pure Go projects with no `.loader.ts` files have no runtime dependency.
 
