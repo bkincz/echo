@@ -39,7 +39,7 @@ func Scan(pagesDir string) ([]Route, error) {
 
 		ext := filepath.Ext(path)
 		switch ext {
-		case ".tsx", ".ts", ".jsx", ".js", ".svelte":
+		case ".tsx", ".ts", ".jsx", ".js":
 		default:
 			return nil
 		}

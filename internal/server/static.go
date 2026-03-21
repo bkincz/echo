@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -9,7 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/echo-ssr/echo/internal/layout"
+	"github.com/echo-ssr/echo/internal/config"
+	"github.com/echo-ssr/echo/internal/frontend"
 	"github.com/echo-ssr/echo/internal/loader"
 	"github.com/echo-ssr/echo/internal/renderer"
 )
@@ -22,16 +24,22 @@ func BuildStatic(appDir string, opts ...BuildOptions) error {
 	if err != nil {
 		return err
 	}
+	cfg, err := config.Load(abs)
+	if err != nil {
+		return fmt.Errorf("loading config: %w", err)
+	}
 
 	logger := slog.Default()
+	buildOpts := BuildOptions{}
 	var goLoaders map[string]LoaderFunc
 	var goPaths map[string]PathsFunc
 	if len(opts) > 0 {
-		if opts[0].Logger != nil {
-			logger = opts[0].Logger
+		buildOpts = opts[0]
+		if buildOpts.Logger != nil {
+			logger = buildOpts.Logger
 		}
-		goLoaders = opts[0].GoLoaders
-		goPaths = opts[0].GoPaths
+		goLoaders = buildOpts.GoLoaders
+		goPaths = buildOpts.GoPaths
 	}
 
 	logger.Info("static build: compiling bundles")
@@ -48,12 +56,26 @@ func BuildStatic(appDir string, opts ...BuildOptions) error {
 	if err := json.Unmarshal(manifestData, &m); err != nil {
 		return fmt.Errorf("parsing manifest: %w", err)
 	}
+	if m.Frontend == nil || m.Frontend.SSREntry == "" {
+		return fmt.Errorf("manifest missing frontend SSR metadata")
+	}
+
+	engine := resolveFrontendEngine(buildOpts.Frontend, logger, 0)
+	if engine == nil {
+		return fmt.Errorf("frontend engine unavailable for static SSR rendering")
+	}
+	defer func() {
+		if err := engine.Close(); err != nil {
+			logger.Warn("static build: frontend shutdown", "engine", engine.Name(), "err", err)
+		}
+	}()
 
 	pagesDir := filepath.Join(abs, "pages")
 	loaderFiles, _ := loader.Find(pagesDir)
 	jsLoaders := make(map[string]*loader.Loader, len(loaderFiles))
+	runnerOpts := loaderRunnerOptionsFromConfig(cfg)
 	for key, filePath := range loaderFiles {
-		l, err := loader.Build(abs, filePath)
+		l, err := loader.BuildWithOptions(abs, filePath, runnerOpts)
 		if err != nil {
 			logger.Warn("static build: skipping loader", "key", key, "err", err)
 			continue
@@ -62,9 +84,6 @@ func BuildStatic(appDir string, opts ...BuildOptions) error {
 		jsLoaders[key] = l
 	}
 
-	layoutMap, _ := layout.Find(pagesDir)
-	_ = layoutMap
-
 	logger.Info("static build: generating HTML")
 	for _, mr := range m.Routes {
 		pathEntries, err := resolvePathEntries(mr, jsLoaders, goLoaders, goPaths, logger)
@@ -72,7 +91,7 @@ func BuildStatic(appDir string, opts ...BuildOptions) error {
 			return err
 		}
 		for _, params := range pathEntries {
-			if err := writeStaticPage(abs, distDir, mr, params, jsLoaders, goLoaders, logger); err != nil {
+			if err := writeStaticPage(abs, distDir, mr, params, jsLoaders, goLoaders, engine, m.Frontend.SSREntry, logger); err != nil {
 				return err
 			}
 		}
@@ -123,6 +142,8 @@ func writeStaticPage(
 	params map[string]string,
 	jsLoaders map[string]*loader.Loader,
 	goLoaders map[string]LoaderFunc,
+	engine frontend.Engine,
+	ssrEntry string,
 	logger *slog.Logger,
 ) error {
 	cssBundleURL := ""
@@ -139,7 +160,6 @@ func writeStaticPage(
 		return fmt.Errorf("rendering shell for %s: %w", mr.Pattern, err)
 	}
 
-	// Call loader.
 	var data json.RawMessage
 	if goLoaders != nil {
 		if fn, ok := goLoaders[mr.Pattern]; ok {
@@ -165,18 +185,29 @@ func writeStaticPage(
 			}
 		}
 	}
-	if data != nil {
-		shell = injectLoaderData(shell, data)
+	urlPath := concretePatternPath(mr.Pattern, params)
+	rendered, err := engine.Render(context.Background(), appDir, frontend.RenderOptions{
+		SSREntry:     ssrEntry,
+		URL:          urlPath,
+		RoutePattern: mr.Pattern,
+		Status:       http.StatusOK,
+		Shell:        shell,
+		LoaderData:   data,
+	})
+	if err != nil {
+		return fmt.Errorf("rendering static page %s: %w", mr.Pattern, err)
 	}
 
-	// Determine output file path
 	outFile := patternToFilePath(mr.Pattern, params)
-	fullPath := filepath.Join(distDir, filepath.FromSlash(outFile))
+	fullPath, err := safeJoinUnder(distDir, outFile)
+	if err != nil {
+		return fmt.Errorf("resolving static output path for %s: %w", outFile, err)
+	}
 
 	if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
 		return fmt.Errorf("creating dir for %s: %w", outFile, err)
 	}
-	if err := os.WriteFile(fullPath, []byte(shell), 0o644); err != nil {
+	if err := os.WriteFile(fullPath, []byte(rendered.HTML), 0o644); err != nil {
 		return fmt.Errorf("writing %s: %w", outFile, err)
 	}
 	logger.Info("wrote", "file", outFile)
@@ -192,11 +223,7 @@ func isDynamicPattern(pattern string) bool {
 }
 
 func patternToFilePath(pattern string, params map[string]string) string {
-	p := pattern
-	for name, val := range params {
-		p = strings.ReplaceAll(p, "{"+name+"...}", val)
-		p = strings.ReplaceAll(p, "{"+name+"}", val)
-	}
+	p := concretePatternPath(pattern, params)
 	p = strings.TrimPrefix(p, "/")
 	if p == "" {
 		return "index.html"
@@ -205,14 +232,19 @@ func patternToFilePath(pattern string, params map[string]string) string {
 }
 
 func syntheticRequest(pattern string, params map[string]string) *http.Request {
-	p := pattern
-	for name, val := range params {
-		p = strings.ReplaceAll(p, "{"+name+"...}", val)
-		p = strings.ReplaceAll(p, "{"+name+"}", val)
-	}
+	p := concretePatternPath(pattern, params)
 	req, _ := http.NewRequest(http.MethodGet, p, nil)
 	for name, val := range params {
 		req.SetPathValue(name, val)
 	}
 	return req
+}
+
+func concretePatternPath(pattern string, params map[string]string) string {
+	p := pattern
+	for name, val := range params {
+		p = strings.ReplaceAll(p, "{"+name+"...}", val)
+		p = strings.ReplaceAll(p, "{"+name+"}", val)
+	}
+	return p
 }

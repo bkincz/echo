@@ -81,7 +81,7 @@ func scanLayouts(pagesDir string) (map[string]string, error) {
 }
 
 func scanPageKeys(pagesDir string) ([]string, error) {
-	pageExts := map[string]bool{".tsx": true, ".ts": true, ".jsx": true, ".js": true, ".svelte": true}
+	pageExts := map[string]bool{".tsx": true, ".ts": true, ".jsx": true, ".js": true}
 	var keys []string
 	err := filepath.WalkDir(pagesDir, func(path string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() {

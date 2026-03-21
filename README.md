@@ -1,126 +1,137 @@
 # Echo
 
-A fast, minimal SSR framework for Go. File-based routing, esbuild bundling, dependency-aware hot reload, and a single binary server. Works with React, Svelte, and Vue out of the box.
+A minimal SSR framework for Go and React. File-based routing, server-side data loading, Vite-backed SSR, and a single Go binary.
+
+**Requirements:** Go 1.24+, Node.js 18+
 
 ```bash
 go install github.com/echo-ssr/echo/cmd/echo@latest
 ```
 
-## Getting Started
+---
+
+## Quick Start
 
 ```bash
-echo init my-app        # React (default)
-echo init my-app --svelte
-echo init my-app --vue
-
+echo init my-app
 cd my-app
 npm install
 echo dev .
 ```
 
-Open `http://localhost:3000`.
-
-Add `--node` to any of the above to scaffold JS loader files that run server-side data fetching via Node.js or Bun:
+Open `http://localhost:3000`. Add `--node` to include JS loader and API route support:
 
 ```bash
 echo init my-app --node
-echo init my-app --svelte --node
 ```
 
 ---
 
-## File-based Routing
+## Features
 
-Routes are derived from the `pages/` directory:
+- File-based routing from a `pages/` directory
+- Nested layouts via `_layout.tsx`
+- Server-side data loading — Go functions or JS loader files
+- JS API routes under `pages/api/`
+- Streaming SSR via `renderToPipeableStream` — Suspense boundaries resolve as data arrives
+- Hot reload in dev with browser error overlay
+- Per-page `title` / `description` via `.meta.json` sidecars
+- CSS and CSS Modules out of the box. Including Lightning CSS as optional
+- Static site generation (`echo build --static`)
+- Custom middleware, headers, and esbuild plugins
+- Health endpoint at `/_echo/health`
 
-```text
-pages/index.tsx          →  /
-pages/about.tsx          →  /about
-pages/blog/index.tsx     →  /blog
-pages/blog/[id].tsx      →  /blog/{id}
-pages/docs/[...slug].tsx →  /docs/{slug...}
-pages/404.tsx            →  served on unmatched routes (404 status)
-pages/500.tsx            →  served on loader errors and panics (500 status)
+---
+
+## App Structure
+
+```
+my-app/
+  client.tsx              # Client mount function (hydration entry)
+  src/
+    entry-server.tsx      # SSR render function
+  pages/
+    _layout.tsx           # Root layout (optional)
+    index.tsx             # Route: /
+    about.tsx             # Route: /about
+    about.meta.json       # Optional title + description
+    404.tsx               # Custom 404 page
+    500.tsx               # Custom error page
+    blog/
+      _layout.tsx         # Nested layout for /blog/*
+      [id].tsx            # Route: /blog/{id}
+      [id].loader.ts      # JS data loader (--node)
+    api/
+      users.ts            # API route: /api/users (--node)
+  public/                 # Static assets
+  echo.config.json
+  vite.config.ts
+  package.json
 ```
 
-Dynamic segments use `[param]`, catch-all segments use `[...param]`. Both receive their values at runtime via `r.PathValue()` in Go loaders, or as `params` in JS loaders.
+---
+
+## Routing
+
+Routes are derived from filenames in `pages/`:
+
+```
+pages/index.tsx          →  /
+pages/about.tsx          →  /about
+pages/blog/[id].tsx      →  /blog/{id}
+pages/docs/[...slug].tsx →  /docs/{slug...}
+pages/404.tsx            →  unmatched routes (404)
+pages/500.tsx            →  loader errors and panics (500)
+```
 
 ---
 
 ## Layouts
 
-Place a `_layout` file in any directory to wrap all pages in that directory and below:
-
-```text
-pages/
-  _layout.tsx          ← wraps every page
-  index.tsx
-  blog/
-    _layout.tsx        ← wraps blog/* only, nested inside root layout
-    [id].tsx
-```
-
-Layouts receive `children` (React) or use `<slot />` (Svelte) / the default slot (Vue). The layout chain is computed at build time, zero runtime overhead.
+Place `_layout.tsx` in any directory to wrap all pages at that level and below:
 
 ```tsx
 // pages/_layout.tsx
-import type { ReactNode } from "react";
-
-export default function Layout({ children }: { children: ReactNode }) {
+export default function Layout({ children }: { children: React.ReactNode }) {
   return (
-    <div>
+    <>
       <nav>...</nav>
       {children}
-    </div>
+    </>
   );
 }
 ```
+
+Layouts nest automatically — a `pages/blog/_layout.tsx` wraps inside the root layout.
 
 ---
 
 ## Data Loading
 
-### Go loaders (recommended)
+### Go loaders
 
-Register a loader function per route before calling `Start()`. The return value is JSON-encoded and available client-side via `useLoaderData()`.
+Register a loader per route before calling `Start()`. The return value is available in the page via `loaderData` and on the client via `useLoaderData()`.
 
 ```go
 srv.Loader("/blog/{id}", func(r *http.Request) (any, error) {
-    id := r.PathValue("id")
-    post, err := db.GetPost(id)
-    return post, err
+    return db.GetPost(r.PathValue("id"))
 })
 ```
 
 ```tsx
 // pages/blog/[id].tsx
-import { useLoaderData } from "../client";
-
 export default function Post({ loaderData }: { loaderData?: Post }) {
   return <article>{loaderData?.title}</article>;
 }
 ```
 
-### JS loaders (opt-in, requires Node.js or Bun)
-
-Scaffold with `echo init --node`, or create `pages/<route>.loader.ts` manually:
+### JS loaders (requires `--node`)
 
 ```ts
-// pages/index.loader.ts
-export async function loader({ params, searchParams, headers }) {
-  const res = await fetch("https://api.example.com/data");
-  return res.json();
+// pages/blog/[id].loader.ts
+export async function loader({ params }) {
+  return fetchPost(params.id);
 }
-```
-
-The loader receives `{ params, searchParams, headers }` and its return value is injected into the page shell identically to a Go loader.
-
-Loader data is embedded in the HTML as:
-
-```html
-<script id="__echo_data__" type="application/json">
-  { "key": "value" }
-</script>
 ```
 
 ---
@@ -130,219 +141,136 @@ Loader data is embedded in the HTML as:
 ### Go handlers
 
 ```go
-srv.Handle("GET /api/users", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-    json.NewEncoder(w).Encode(users)
-}))
+srv.Handle("GET /api/users", usersHandler)
 ```
 
-Go handlers are registered before page routes, so they always take precedence.
-
-### JS API handlers (opt-in, requires Node.js or Bun)
+### JS handlers (requires `--node`)
 
 ```ts
 // pages/api/users.ts
 export async function handler(req) {
-  return {
-    status: 200,
-    headers: { "Content-Type": "application/json" },
-    body: { users: [] },
-  };
+  return { status: 200, body: { users: [] } };
 }
 ```
 
-Files under `pages/api/` are auto-detected and served at `/api/<route>`.
-
 ---
 
-## Error Pages
+## Client-Side Routing
 
-### 404
+Echo ships the infrastructure — you choose the router.
 
-`pages/404.tsx` is served with status `404` for any request that doesn't match a page route or static file.
+**`virtual:echo-pages`** is a generated module that maps every route to its page and layout chain:
 
-### 500
+```ts
+import { pages, echoPatternToPath } from "virtual:echo-pages";
 
-`pages/500.tsx` is served with status `500` when a loader returns an error or a panic is recovered. Error context is injected as loader data:
+// pages["/{id}"] = { load: () => import("..."), layouts: [() => import("...")] }
+// echoPatternToPath("/blog/{id}") → "/blog/:id"
+// echoPatternToPath("/files/{slug...}") → "/files/*"
+```
+
+**`GET /_echo/data/<path>`** runs the route's loader and returns JSON — call it from your router's loader function on client-side navigation.
+
+Example wiring with React Router v7 (add `react-router-dom` yourself):
 
 ```tsx
-interface ErrorData {
-  message: string;
-  path: string;
-  status: number;
-}
+// client.tsx
+import { createBrowserRouter, RouterProvider, useLoaderData } from "react-router-dom";
+import { pages, echoPatternToPath } from "virtual:echo-pages";
 
-export default function ErrorPage({ loaderData }: { loaderData?: ErrorData }) {
-  return (
-    <main>
-      <h1>Something went wrong</h1>
-      {loaderData && <p>{loaderData.message}</p>}
-    </main>
-  );
-}
-```
+const router = createBrowserRouter(
+  Object.entries(pages).map(([pattern, { load, layouts }], idx) => ({
+    id: String(idx),
+    path: echoPatternToPath(pattern),
+    lazy: async () => {
+      const [page, ...ls] = await Promise.all([load(), ...layouts.map(l => l())]);
+      function Route() {
+        const data = useLoaderData();
+        let node = <page.default loaderData={data} />;
+        for (let i = ls.length - 1; i >= 0; i--)
+          if (ls[i].default) node = <ls[i].default>{node}</ls[i].default>;
+        return node;
+      }
+      return { Component: Route };
+    },
+    loader: async ({ request }) => {
+      const url = new URL(request.url);
+      const res = await fetch("/_echo/data" + url.pathname + url.search);
+      return res.ok ? res.json() : null;
+    },
+  }))
+);
 
-Panic recovery is applied as the outermost middleware layer, it catches panics anywhere in the request chain.
-
----
-
-## Configuration
-
-### echo.config.json
-
-```json
-{
-  "port": "3000",
-  "headers": {
-    "X-Frame-Options": "DENY",
-    "X-Content-Type-Options": "nosniff"
-  }
+export function mount(root: Element) {
+  hydrateRoot(root, <RouterProvider router={router} />);
 }
 ```
 
-### echo.config.ts
-
-TypeScript config is supported. Echo compiles it with esbuild (no Node.js required for this step) then executes the result to extract the exported object:
-
-```ts
-// echo.config.ts
-interface Config {
-  port?: string;
-  headers?: Record<string, string>;
-}
-
-const config: Config = {
-  port: "3000",
-  headers: { "X-Frame-Options": "DENY" },
-};
-
-export default config;
-```
-
-`echo.config.ts` takes precedence over `echo.config.json`. Port can also be overridden at runtime via the `PORT` environment variable.
-
----
-
-## Static Site Generation
-
-```bash
-echo build ./my-app --static
-```
-
-Generates a flat `index.html` per route into `dist/`, suitable for any CDN or static host. Loader data is embedded in each file, no server required at runtime.
-
-Dynamic routes require a `paths()` export in their loader file:
-
-```ts
-// pages/blog/[id].loader.ts
-export async function paths() {
-  const posts = await fetchAllPosts();
-  return posts.map((p) => ({ id: String(p.id) }));
-}
-
-export async function loader({ params }) {
-  return fetchPost(params.id);
-}
-```
-
-Or register a Go `PathsFunc` when using Echo as a library:
-
-```go
-srv.Paths("/blog/{id}", func() ([]map[string]string, error) {
-    ids, _ := db.AllPostIDs()
-    return ids, nil
-})
-server.BuildStatic(".", server.BuildOptions{GoPaths: srv.GoPaths})
-```
+The scaffolded `client.tsx` ships a simpler `mount(root, layouts, page)` for single-page SSR hydration with a comment showing the above pattern.
 
 ---
 
 ## CSS
 
-Import CSS directly from any page or shared module:
+Plain CSS and CSS Modules work out of the box:
 
 ```tsx
-import "./about.css";
-```
-
-esbuild extracts CSS into a separate bundle and Echo injects `<link rel="stylesheet">` automatically.
-
-**CSS Modules** are supported via `.module.css` files:
-
-```tsx
+import "./page.css";
 import styles from "./hero.module.css";
-<div className={styles.hero}>...</div>;
 ```
 
-**Lightning CSS** (autoprefixing, nesting, modern color functions) is enabled automatically when `lightningcss` is installed:
+For autoprefixing, nesting, and modern color functions, install [Lightning CSS](https://lightningcss.dev) — Echo picks it up automatically:
 
 ```bash
 npm install --save-dev lightningcss
 ```
 
+For SCSS or other preprocessors, configure them in `vite.config.ts` as you normally would.
+
 ---
 
-## Per-page Metadata
+## Configuration
 
-Place a `<page>.meta.json` sidecar next to any page:
+`echo.config.json` (or `echo.config.ts` for TypeScript):
 
 ```json
 {
-  "title": "About Us",
-  "description": "Learn more about our team."
+  "port": 3000,
+  "headers": {
+    "Content-Security-Policy": "default-src 'self'"
+  },
+  "js": {
+    "loaderTimeoutMs": 10000,
+    "apiTimeoutMs": 10000,
+    "pathsTimeoutMs": 10000
+  }
 }
 ```
 
-Without a sidecar the title is derived from the URL pattern. Editing a `.meta.json` file triggers hot reload.
-
----
-
-## Hot Reload
-
-In dev mode Echo injects an SSE listener. On file changes:
-
-1. Routes are rescanned
-2. Only the bundles whose esbuild dependency graph includes the changed file are recompiled
-3. Connected browsers reload
-
-Layout file changes trigger a full rebuild for all affected pages. Build errors display as a browser overlay rather than a silent stale reload.
+`PORT` env var overrides the configured port. Echo sets `X-Content-Type-Options`, `X-Frame-Options`, and `Referrer-Policy` by default — use `headers` to override them.
 
 ---
 
 ## CLI
 
-```text
-echo init  [app-dir] [--svelte] [--vue] [--node]   Scaffold a new app
-echo dev   [app-dir]                                Dev server with hot reload
-echo build [app-dir] [--static]                     Compile bundles to dist/
-echo start [app-dir]                                Serve from dist/
 ```
-
-`PORT` environment variable overrides the configured port:
-
-```bash
-PORT=8080 echo start ./my-app
+echo init   [app-dir] [--node]    Scaffold a new app
+echo dev    [app-dir]             Dev server with hot reload
+echo build  [app-dir] [--static]  Compile to dist/
+echo start  [app-dir]             Serve from dist/
+echo version                      Print version
 ```
 
 ---
 
-## Production Workflow
+## Production
 
 ```bash
-echo build ./my-app    # writes dist/
-echo start ./my-app    # serves from dist/, no recompilation
+echo build ./my-app
+echo start ./my-app
 ```
 
-`dist/` layout:
-
-```text
-dist/
-  manifest.json          # route table read by echo start
-  _echo/bundle/*.js      # minified, content-hashed page bundles
-  _echo/bundle/*.css     # extracted CSS bundles
-  public/                # copied from your app's public/
-```
-
-`echo start` reads the manifest and serves everything from `dist/`. No TypeScript, no esbuild, no Node.js at runtime.
+`dist/` contains minified, content-hashed bundles and a manifest read by `echo start`.
 
 ### Docker
 
@@ -354,6 +282,7 @@ COPY . .
 RUN npm ci && echo build .
 
 FROM debian:bookworm-slim
+RUN apt-get install -y nodejs
 COPY --from=build /go/bin/echo /usr/local/bin/echo
 COPY --from=build /app/dist ./dist
 CMD ["echo", "start", "."]
@@ -361,79 +290,40 @@ CMD ["echo", "start", "."]
 
 ---
 
-## Go Library Usage
+## Static Site Generation
 
-Echo can be embedded in any Go application, giving full access to Go loaders, API handlers, and custom middleware:
+```bash
+echo build ./my-app --static
+```
 
-```go
-package main
+Generates a flat `index.html` per route into `dist/`. Dynamic routes require a `paths()` export in their loader:
 
-import (
-    "net/http"
-    "github.com/echo-ssr/echo/internal/server"
-)
-
-func main() {
-    srv, err := server.New(".", false, server.ServerOptions{
-        Middleware: []func(http.Handler) http.Handler{
-            corsMiddleware,
-        },
-    })
-    if err != nil {
-        log.Fatal(err)
-    }
-
-    srv.Loader("/", func(r *http.Request) (any, error) {
-        return db.GetHomepageData()
-    })
-
-    srv.Handle("GET /api/users", usersHandler)
-
-    srv.Start(":3000")
+```ts
+// pages/blog/[id].loader.ts
+export async function paths() {
+  const posts = await fetchAllPosts();
+  return posts.map((p) => ({ id: String(p.id) }));
 }
 ```
 
 ---
 
-## App Structure
+## Go Library
 
-```text
-my-app/
-  client.tsx              # Exports mount(root, layouts, pageModule)
-  echo.config.json        # Optional: port, response headers
-  pages/
-    _layout.tsx           # Root layout (optional)
-    index.tsx             # Route: /
-    about.tsx             # Route: /about
-    about.meta.json       # Optional per-page title/description
-    404.tsx               # Custom 404 page (optional)
-    500.tsx               # Custom error page (optional)
-    blog/
-      _layout.tsx         # Nested layout for /blog/* (optional)
-      [id].tsx            # Route: /blog/{id}
-      [id].loader.ts      # JS loader (--node only)
-    api/
-      users.ts            # JS API route: /api/users (--node only)
-  public/                 # Static assets served at /
-  package.json
-  tsconfig.json
+Echo can be embedded in any Go application:
+
+```go
+srv, err := server.New(".", false, server.ServerOptions{
+    Middleware: []func(http.Handler) http.Handler{corsMiddleware},
+})
+
+srv.Loader("/", func(r *http.Request) (any, error) {
+    return db.GetHomepageData()
+})
+
+srv.Handle("GET /api/users", usersHandler)
+srv.Start(":3000")
 ```
-
----
-
-## Health Endpoint
-
-`GET /_echo/health` is available in both dev and production:
-
-```json
-{ "status": "ok", "version": "1.0.0" }
-```
-
-## JS Runtime
-
-When JS loaders, JS API routes, or the Svelte/Vue compiler plugin are in use, Echo requires Node.js or Bun. **Bun is preferred automatically** when available (~5 ms startup vs ~80 ms for Node). No configuration required, Echo detects whichever runtime is in `PATH`.
-
-If neither is installed, Echo will surface a clear error only when a JS feature is actually invoked. Pure Go projects with no `.loader.ts` files have no runtime dependency.
 
 ---
 

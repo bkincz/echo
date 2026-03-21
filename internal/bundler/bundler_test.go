@@ -10,6 +10,14 @@ import (
 	"github.com/evanw/esbuild/pkg/api"
 )
 
+func canonicalPath(p string) string {
+	normalized := filepath.Clean(filepath.FromSlash(p))
+	if resolved, err := filepath.EvalSymlinks(normalized); err == nil {
+		normalized = resolved
+	}
+	return filepath.ToSlash(filepath.Clean(normalized))
+}
+
 // ---------------------------------------------------------------------------
 // joinMessages
 // ---------------------------------------------------------------------------
@@ -161,6 +169,32 @@ func TestParseInputs(t *testing.T) {
 		}
 	})
 
+	t.Run("dot-relative paths resolve against working directory", func(t *testing.T) {
+		t.Parallel()
+		rel := filepath.Join("..", "..", "var", "folders", "echo", "styles.css")
+		meta := map[string]interface{}{
+			"inputs": map[string]interface{}{
+				rel: map[string]interface{}{},
+			},
+		}
+		data, _ := json.Marshal(meta)
+		got, err := parseInputs(string(data), "/app")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("expected 1 input, got %d", len(got))
+		}
+		want, err := filepath.Abs(rel)
+		if err != nil {
+			t.Fatalf("filepath.Abs: %v", err)
+		}
+		want = filepath.ToSlash(filepath.Clean(want))
+		if got[0] != want {
+			t.Errorf("expected %q, got %q", want, got[0])
+		}
+	})
+
 	t.Run("invalid JSON returns error", func(t *testing.T) {
 		t.Parallel()
 		_, err := parseInputs("not json", "/app")
@@ -206,10 +240,10 @@ func TestCompilerBuildCSS(t *testing.T) {
 		if b.CSS == "" {
 			t.Error("expected non-empty CSS output — CSS import should produce a separate bundle")
 		}
-		wantInput := filepath.ToSlash(cssPath)
+		wantInput := canonicalPath(cssPath)
 		found := false
 		for _, inp := range b.Inputs {
-			if inp == wantInput {
+			if canonicalPath(inp) == wantInput {
 				found = true
 				break
 			}

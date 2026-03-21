@@ -44,6 +44,12 @@ func New(onChange func(paths []string), dirs ...string) (*Watcher, error) {
 // ---------------------------------------------------------------------------
 // Internal
 // ---------------------------------------------------------------------------
+var skipDirs = map[string]bool{
+	"node_modules": true,
+	"dist":         true,
+	".git":         true,
+}
+
 func addRecursive(fw *fsnotify.Watcher, dir string) error {
 	info, err := os.Stat(dir)
 	if err != nil {
@@ -58,6 +64,9 @@ func addRecursive(fw *fsnotify.Watcher, dir string) error {
 	return filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || !d.IsDir() {
 			return err
+		}
+		if skipDirs[d.Name()] {
+			return filepath.SkipDir
 		}
 		return fw.Add(path)
 	})

@@ -11,15 +11,11 @@ var (
 	runtime string
 )
 
-// Find returns the name of the first available JS runtime (bun preferred over
-// node). Returns "" if neither is found in PATH.
+// Find returns "node" when Node.js is available in PATH, otherwise "".
 func Find() string {
 	once.Do(func() {
-		for _, rt := range []string{"bun", "node"} {
-			if _, err := exec.LookPath(rt); err == nil {
-				runtime = rt
-				return
-			}
+		if _, err := exec.LookPath("node"); err == nil {
+			runtime = "node"
 		}
 	})
 	return runtime
@@ -31,7 +27,7 @@ func Find() string {
 func Require() (string, error) {
 	rt := Find()
 	if rt == "" {
-		return "", errors.New("Node.js or Bun is required but neither was found in PATH")
+		return "", errors.New("Node.js is required but was not found in PATH")
 	}
 	return rt, nil
 }

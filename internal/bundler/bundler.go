@@ -221,8 +221,17 @@ func parseInputs(metaJSON string, appDir string) ([]string, error) {
 		if input == "<stdin>" {
 			continue
 		}
-		normalized := input
-		if !filepath.IsAbs(normalized) {
+		normalized := filepath.FromSlash(input)
+		switch {
+		case filepath.IsAbs(normalized):
+		case strings.HasPrefix(input, "./") || strings.HasPrefix(input, "../") ||
+			strings.HasPrefix(input, ".\\") || strings.HasPrefix(input, "..\\"):
+			if abs, err := filepath.Abs(normalized); err == nil {
+				normalized = abs
+			} else {
+				normalized = filepath.Join(appDir, normalized)
+			}
+		default:
 			normalized = filepath.Join(appDir, normalized)
 		}
 		normalized = filepath.ToSlash(filepath.Clean(normalized))

@@ -24,6 +24,8 @@ import (
 
 	"github.com/echo-ssr/echo/internal/bundler"
 	"github.com/echo-ssr/echo/internal/config"
+	"github.com/echo-ssr/echo/internal/frontend"
+	"github.com/echo-ssr/echo/internal/jsruntime"
 	"github.com/echo-ssr/echo/internal/layout"
 	"github.com/echo-ssr/echo/internal/loader"
 	"github.com/echo-ssr/echo/internal/plugins"
@@ -32,7 +34,8 @@ import (
 	"github.com/echo-ssr/echo/internal/watcher"
 )
 
-const version = "1.0.1"
+// Version is the current Echo server version, exposed via the health endpoint.
+const Version = "2.0.0"
 
 // ---------------------------------------------------------------------------
 // Types
@@ -57,10 +60,19 @@ type ServerOptions struct {
 	// Logger is used for all server-side log output. Defaults to slog.Default().
 	Logger *slog.Logger
 
-	// Plugins are passed directly to esbuild. We use them to add support for
-	// non-standard file types (e.g. .svelte, .vue) by providing a custom
-	// OnLoad handler for the relevant extensions.
+	// Plugins are passed directly to esbuild and run in the order provided.
 	Plugins []esbuild.Plugin
+	// Frontend is the JS toolchain engine used for dev/build orchestration.
+	// Defaults to the Vite engine when nil.
+	Frontend frontend.Engine
+	// FrontendDev configures the frontend dev server process.
+	FrontendDev frontend.DevOptions
+	// FrontendSSREntry optionally overrides the frontend SSR entry.
+	FrontendSSREntry string
+	// FrontendWorkers sets the number of concurrent SSR render worker processes.
+	// Each worker is a separate Node.js process, so renders execute in parallel
+	// across all CPU cores. Defaults to runtime.NumCPU() when 0.
+	FrontendWorkers int
 }
 
 type manifestRoute struct {
@@ -73,7 +85,15 @@ type manifestRoute struct {
 }
 
 type manifest struct {
-	Routes []manifestRoute `json:"routes"`
+	Routes   []manifestRoute   `json:"routes"`
+	Frontend *manifestFrontend `json:"frontend,omitempty"`
+}
+
+type manifestFrontend struct {
+	Engine    string `json:"engine"`
+	SSREntry  string `json:"ssrEntry"`
+	ClientDir string `json:"clientDir,omitempty"`
+	ServerDir string `json:"serverDir,omitempty"`
 }
 
 type buildResult struct {
@@ -107,25 +127,28 @@ type compiledPage struct {
 // ---------------------------------------------------------------------------
 
 type Server struct {
-	appDir     string
-	devMode    bool
-	cfg        config.Config
-	mu         sync.RWMutex
-	pages      []compiledPage
-	bundles    map[string]string
-	inputs     map[string]map[string]struct{}
-	jsLoaders  map[string]*loader.Loader
-	apiRunners map[string]*loader.APIRunner
-	handler    http.Handler
-	chain      http.Handler
-	logger     *slog.Logger
-	compiler   *bundler.Compiler
-	goLoaders  map[string]LoaderFunc
-	goPaths    map[string]PathsFunc
-	goHandlers map[string]http.Handler
-	rebuildMu  sync.Mutex
-	sseClients sync.Map
-	w          *watcher.Watcher
+	appDir      string
+	devMode     bool
+	cfg         config.Config
+	mu          sync.RWMutex
+	pages       []compiledPage
+	bundles     map[string]string
+	inputs      map[string]map[string]struct{}
+	jsLoaders   map[string]*loader.Loader
+	apiRunners  map[string]*loader.APIRunner
+	handler     http.Handler
+	chain       http.Handler
+	logger      *slog.Logger
+	compiler    *bundler.Compiler
+	goLoaders   map[string]LoaderFunc
+	goPaths     map[string]PathsFunc
+	goHandlers  map[string]http.Handler
+	rebuildMu   sync.Mutex
+	sseClients  sync.Map
+	w           *watcher.Watcher
+	frontend    frontend.Engine
+	frontendDev frontend.DevOptions
+	frontendSSR string
 }
 
 func (s *Server) Paths(pattern string, fn PathsFunc) *Server {
@@ -147,30 +170,19 @@ func (s *Server) Loader(pattern string, fn LoaderFunc) *Server {
 // Constructors
 // ---------------------------------------------------------------------------
 
-// autoPlugins detects framework-specific esbuild plugins from the project's
-// node_modules and returns them. Auto-detected plugins run after any plugins
-// supplied via ServerOptions, so user-provided plugins take precedence.
-
-// NOTE: We need to expand and refactor this as we add support for more frameworks.
-func autoPlugins(appDir string, logger *slog.Logger) []esbuild.Plugin {
-	var detected []esbuild.Plugin
-	if plugins.FindSvelte(appDir) {
-		logger.Info("Svelte: plugin enabled")
-		detected = append(detected, plugins.SveltePlugin(appDir))
-	}
-	if plugins.FindVue(appDir) {
-		logger.Info("Vue: plugin enabled")
-		detected = append(detected, plugins.VuePlugin(appDir))
-	}
-	return detected
-}
-
 func createChain(inner http.Handler, mw []func(http.Handler) http.Handler) http.Handler {
 	h := inner
 	for i := len(mw) - 1; i >= 0; i-- {
 		h = mw[i](h)
 	}
 	return h
+}
+
+func resolveFrontendEngine(engine frontend.Engine, logger *slog.Logger, workers int) frontend.Engine {
+	if engine != nil {
+		return engine
+	}
+	return frontend.NewViteEngine(frontend.ViteOptions{Logger: logger, Workers: workers})
 }
 
 func (s *Server) initServer(opts ServerOptions) {
@@ -185,7 +197,7 @@ func (s *Server) initServer(opts ServerOptions) {
 		s.mu.RUnlock()
 		h.ServeHTTP(w, r)
 	})
-	mw := []func(http.Handler) http.Handler{gzipMiddleware}
+	mw := []func(http.Handler) http.Handler{gzipMiddleware, securityHeadersMiddleware}
 	if len(s.cfg.Headers) > 0 {
 		mw = append(mw, headersMiddleware(s.cfg.Headers))
 	}
@@ -215,7 +227,7 @@ func New(appDir string, devMode bool, opts ...ServerOptions) (*Server, error) {
 	compilerOpts := bundler.Options{
 		AppDir:  abs,
 		Minify:  !devMode,
-		Plugins: append(opt.Plugins, autoPlugins(abs, opt.Logger)...),
+		Plugins: append([]esbuild.Plugin{plugins.EchoPages(abs)}, opt.Plugins...),
 	}
 	if lc := plugins.FindLightningCSS(abs); lc != "" {
 		opt.Logger.Info("CSS: Lightning CSS enabled")
@@ -227,17 +239,20 @@ func New(appDir string, devMode bool, opts ...ServerOptions) (*Server, error) {
 	}
 
 	s := &Server{
-		appDir:     abs,
-		devMode:    devMode,
-		cfg:        cfg,
-		bundles:    make(map[string]string),
-		inputs:     make(map[string]map[string]struct{}),
-		jsLoaders:  make(map[string]*loader.Loader),
-		apiRunners: make(map[string]*loader.APIRunner),
-		goLoaders:  make(map[string]LoaderFunc),
-		goPaths:    make(map[string]PathsFunc),
-		goHandlers: make(map[string]http.Handler),
-		compiler:   compiler,
+		appDir:      abs,
+		devMode:     devMode,
+		cfg:         cfg,
+		bundles:     make(map[string]string),
+		inputs:      make(map[string]map[string]struct{}),
+		jsLoaders:   make(map[string]*loader.Loader),
+		apiRunners:  make(map[string]*loader.APIRunner),
+		goLoaders:   make(map[string]LoaderFunc),
+		goPaths:     make(map[string]PathsFunc),
+		goHandlers:  make(map[string]http.Handler),
+		compiler:    compiler,
+		frontend:    resolveFrontendEngine(opt.Frontend, opt.Logger, opt.FrontendWorkers),
+		frontendDev: opt.FrontendDev,
+		frontendSSR: opt.FrontendSSREntry,
 	}
 	s.buildJSLoaders()
 	s.buildAPIRunners()
@@ -273,6 +288,14 @@ func NewProduction(appDir string, opts ...ServerOptions) (*Server, error) {
 		return nil, fmt.Errorf("parsing manifest: %w", err)
 	}
 
+	opt := ServerOptions{}
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
+	if opt.Logger == nil {
+		opt.Logger = slog.Default()
+	}
+
 	pages := make([]compiledPage, 0, len(m.Routes))
 	for _, mr := range m.Routes {
 		cssBundleURL := ""
@@ -303,26 +326,27 @@ func NewProduction(appDir string, opts ...ServerOptions) (*Server, error) {
 	}
 
 	s := &Server{
-		appDir:     abs,
-		devMode:    false,
-		cfg:        cfg,
-		bundles:    make(map[string]string),
-		inputs:     make(map[string]map[string]struct{}),
-		jsLoaders:  make(map[string]*loader.Loader),
-		apiRunners: make(map[string]*loader.APIRunner),
-		goLoaders:  make(map[string]LoaderFunc),
-		goPaths:    make(map[string]PathsFunc),
-		goHandlers: make(map[string]http.Handler),
-		pages:      pages,
+		appDir:      abs,
+		devMode:     false,
+		cfg:         cfg,
+		bundles:     make(map[string]string),
+		inputs:      make(map[string]map[string]struct{}),
+		jsLoaders:   make(map[string]*loader.Loader),
+		apiRunners:  make(map[string]*loader.APIRunner),
+		goLoaders:   make(map[string]LoaderFunc),
+		goPaths:     make(map[string]PathsFunc),
+		goHandlers:  make(map[string]http.Handler),
+		pages:       pages,
+		frontend:    resolveFrontendEngine(opt.Frontend, opt.Logger, opt.FrontendWorkers),
+		frontendDev: opt.FrontendDev,
+		frontendSSR: opt.FrontendSSREntry,
+	}
+	if s.frontendSSR == "" && m.Frontend != nil {
+		s.frontendSSR = m.Frontend.SSREntry
 	}
 	s.buildJSLoaders()
 	s.buildAPIRunners()
 	s.handler = s.createMux(pages)
-
-	opt := ServerOptions{}
-	if len(opts) > 0 {
-		opt = opts[0]
-	}
 	s.initServer(opt)
 	return s, nil
 }
@@ -441,7 +465,7 @@ func (s *Server) buildAPIRunners() {
 	}
 	for _, route := range routes {
 		r := route
-		runner, err := loader.BuildAPI(s.appDir, r.FilePath)
+		runner, err := loader.BuildAPIWithOptions(s.appDir, r.FilePath, loaderRunnerOptionsFromConfig(s.cfg))
 		if err != nil {
 			s.logger.Error("building api handler", "key", r.BundleKey, "err", err)
 			continue
@@ -469,7 +493,7 @@ func (s *Server) buildJSLoaders() {
 }
 
 func (s *Server) rebuildJSLoader(key, filePath string) {
-	l, err := loader.Build(s.appDir, filePath)
+	l, err := loader.BuildWithOptions(s.appDir, filePath, loaderRunnerOptionsFromConfig(s.cfg))
 	if err != nil {
 		s.logger.Error("building loader", "key", key, "err", err)
 		return
@@ -624,23 +648,15 @@ func (s *Server) handleChanges(paths []string) error {
 // Routing
 // ---------------------------------------------------------------------------
 
-// createMux constructs a fresh ServeMux for the current compiled pages.
-// Precedence (high → low):
-//  1. /_echo/*       — internal framework endpoints
-//  2. Page patterns  — e.g. GET /about, GET /blog/{id}
-//  3. GET /{$}       — exact root match (index page)
-//  4. GET /          — static files + 404 fallback
 func (s *Server) createMux(pages []compiledPage) *http.ServeMux {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /_echo/health", s.handleHealth)
 
-	// Go API handlers (registered before page routes so they take precedence).
 	for pattern, h := range s.goHandlers {
 		mux.Handle(pattern, h)
 	}
 
-	// JS API runners.
 	s.mu.RLock()
 	for pat, run := range s.apiRunners {
 		pat, run := pat, run
@@ -678,6 +694,17 @@ func (s *Server) createMux(pages []compiledPage) *http.ServeMux {
 		})
 	}
 
+	for _, p := range pages {
+		cp := p
+		dataPattern := "GET /_echo/data" + cp.route.Pattern
+		if cp.route.Pattern == "/" {
+			dataPattern = "GET /_echo/data/{$}"
+		}
+		mux.HandleFunc(dataPattern, func(w http.ResponseWriter, r *http.Request) {
+			s.handleLoaderData(w, r, cp)
+		})
+	}
+
 	mux.Handle("GET /", s.createStaticHandler(pages))
 	return mux
 }
@@ -709,10 +736,14 @@ func (s *Server) createStaticHandler(pages []compiledPage) http.Handler {
 		return http.HandlerFunc(serve404)
 	}
 
-	fileServer := http.FileServer(noDirListingFS{http.Dir(publicDir)})
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cleanPath := path.Clean("/" + r.URL.Path)
-		fpath := filepath.Join(publicDir, filepath.FromSlash(cleanPath))
+		relPath := strings.TrimPrefix(cleanPath, "/")
+		fpath, err := safeJoinUnder(publicDir, relPath)
+		if err != nil {
+			serve404(w, r)
+			return
+		}
 
 		info, statErr := os.Stat(fpath)
 		if statErr != nil {
@@ -720,15 +751,20 @@ func (s *Server) createStaticHandler(pages []compiledPage) http.Handler {
 			return
 		}
 		if info.IsDir() {
-			indexPath := filepath.Join(fpath, "index.html")
-			if _, err := os.Stat(indexPath); err != nil {
+			indexPath, err := safeJoinUnder(publicDir, path.Join(relPath, "index.html"))
+			if err != nil {
+				serve404(w, r)
+				return
+			}
+			indexInfo, err := os.Stat(indexPath)
+			if err != nil || indexInfo.IsDir() {
 				serve404(w, r)
 				return
 			}
 			http.ServeFile(w, r, indexPath)
 			return
 		}
-		fileServer.ServeHTTP(w, r)
+		http.ServeFile(w, r, fpath)
 	})
 }
 
@@ -762,6 +798,18 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) Start(addr string) error {
+	if _, err := jsruntime.Require(); err != nil {
+		return err
+	}
+
+	if s.frontend != nil {
+		defer func() {
+			if err := s.frontend.Close(); err != nil {
+				s.logger.Warn("frontend shutdown", "engine", s.frontend.Name(), "err", err)
+			}
+		}()
+	}
+
 	if s.compiler != nil {
 		defer s.compiler.Close()
 	}
@@ -775,6 +823,23 @@ func (s *Server) Start(addr string) error {
 		}
 		s.mu.Unlock()
 	}()
+
+	if s.devMode && s.frontend != nil {
+		if err := s.frontend.Validate(s.appDir); err != nil {
+			return fmt.Errorf("frontend validation failed (%s): %w", s.frontend.Name(), err)
+		} else {
+			proc, err := s.frontend.StartDev(context.Background(), s.appDir, s.frontendDev)
+			if err != nil {
+				return fmt.Errorf("frontend dev startup failed (%s): %w", s.frontend.Name(), err)
+			} else if proc != nil {
+				defer func() {
+					if err := proc.Stop(2 * time.Second); err != nil {
+						s.logger.Warn("frontend dev shutdown", "engine", s.frontend.Name(), "err", err)
+					}
+				}()
+			}
+		}
+	}
 
 	if s.devMode {
 		pagesDir := filepath.Join(s.appDir, "pages")
@@ -845,6 +910,76 @@ type BuildOptions struct {
 	GoLoaders map[string]LoaderFunc
 	GoPaths   map[string]PathsFunc
 	Plugins   []esbuild.Plugin
+	// Frontend is the JS toolchain engine used for build orchestration.
+	// Defaults to the Vite engine when nil.
+	Frontend frontend.Engine
+	// Frontend build settings are forwarded to the frontend engine.
+	FrontendClientOutDir string
+	FrontendServerOutDir string
+	FrontendSSREntry     string
+}
+
+type frontendBuildResult struct {
+	Engine    string
+	SSREntry  string
+	ClientDir string
+	ServerDir string
+}
+
+func runFrontendBuild(appDir string, logger *slog.Logger, opts BuildOptions) (frontendBuildResult, error) {
+	engine := resolveFrontendEngine(opts.Frontend, logger, 0)
+	if engine == nil {
+		return frontendBuildResult{}, nil
+	}
+
+	if err := engine.Validate(appDir); err != nil {
+		return frontendBuildResult{}, fmt.Errorf("frontend validation failed (%s): %w", engine.Name(), err)
+	}
+
+	clientOutDir := opts.FrontendClientOutDir
+	if clientOutDir == "" {
+		clientOutDir = filepath.ToSlash(filepath.Join("dist", "client"))
+	}
+	serverOutDir := opts.FrontendServerOutDir
+	if serverOutDir == "" {
+		serverOutDir = filepath.ToSlash(filepath.Join("dist", "server"))
+	}
+	ssrSourceEntry := opts.FrontendSSREntry
+	if ssrSourceEntry == "" {
+		ssrSourceEntry = detectSSREntry(appDir)
+	}
+	if ssrSourceEntry == "" {
+		return frontendBuildResult{}, fmt.Errorf("frontend ssr entry not found (expected one of: src/entry-server.tsx, src/entry.server.tsx, entry-server.tsx, entry.server.tsx)")
+	}
+
+	if err := engine.BuildClient(context.Background(), appDir, frontend.BuildClientOptions{
+		OutDir: clientOutDir,
+	}); err != nil {
+		return frontendBuildResult{}, fmt.Errorf("frontend client build failed (%s): %w", engine.Name(), err)
+	} else {
+		logger.Info("frontend client build complete", "engine", engine.Name())
+	}
+
+	if err := engine.BuildServer(context.Background(), appDir, frontend.BuildServerOptions{
+		SSREntry: ssrSourceEntry,
+		OutDir:   serverOutDir,
+	}); err != nil {
+		return frontendBuildResult{}, fmt.Errorf("frontend ssr build failed (%s): %w", engine.Name(), err)
+	} else {
+		logger.Info("frontend ssr build complete", "engine", engine.Name())
+	}
+
+	ssrBuiltEntry, err := detectBuiltSSREntry(appDir, serverOutDir, ssrSourceEntry)
+	if err != nil {
+		return frontendBuildResult{}, fmt.Errorf("detecting built ssr entry: %w", err)
+	}
+
+	return frontendBuildResult{
+		Engine:    engine.Name(),
+		SSREntry:  filepath.ToSlash(ssrBuiltEntry),
+		ClientDir: filepath.ToSlash(clientOutDir),
+		ServerDir: filepath.ToSlash(serverOutDir),
+	}, nil
 }
 
 // Build compiles all page bundles for appDir (minified, content-hash filenames),
@@ -861,18 +996,26 @@ func Build(appDir string, opts ...BuildOptions) error {
 		return fmt.Errorf("cleaning dist/: %w", err)
 	}
 
-	logger := slog.Default()
-	if len(opts) > 0 && opts[0].Logger != nil {
-		logger = opts[0].Logger
-	}
-	var userPlugins []esbuild.Plugin
+	buildCfg := BuildOptions{}
 	if len(opts) > 0 {
-		userPlugins = opts[0].Plugins
+		buildCfg = opts[0]
 	}
+
+	logger := slog.Default()
+	if buildCfg.Logger != nil {
+		logger = buildCfg.Logger
+	}
+	userPlugins := buildCfg.Plugins
+
+	frontendBuild, err := runFrontendBuild(abs, logger, buildCfg)
+	if err != nil {
+		return err
+	}
+
 	buildOpts := bundler.Options{
 		AppDir:  abs,
 		Minify:  true,
-		Plugins: append(userPlugins, autoPlugins(abs, logger)...),
+		Plugins: userPlugins,
 	}
 	if lc := plugins.FindLightningCSS(abs); lc != "" {
 		logger.Info("CSS: Lightning CSS enabled")
@@ -940,6 +1083,14 @@ func Build(appDir string, opts ...BuildOptions) error {
 	wg.Wait()
 
 	m := manifest{Routes: make([]manifestRoute, 0, len(routes))}
+	if frontendBuild.SSREntry != "" {
+		m.Frontend = &manifestFrontend{
+			Engine:    frontendBuild.Engine,
+			SSREntry:  frontendBuild.SSREntry,
+			ClientDir: frontendBuild.ClientDir,
+			ServerDir: frontendBuild.ServerDir,
+		}
+	}
 	for _, res := range distResults {
 		if res.err != nil {
 			return res.err
@@ -972,7 +1123,7 @@ func Build(appDir string, opts ...BuildOptions) error {
 // Handlers
 // ---------------------------------------------------------------------------
 func (s *Server) handlePage(w http.ResponseWriter, r *http.Request, page compiledPage, status int) {
-	shell := page.shell
+	var loaderData json.RawMessage
 
 	if fn, ok := s.goLoaders[page.route.Pattern]; ok {
 		data, err := fn(r)
@@ -987,25 +1138,113 @@ func (s *Server) handlePage(w http.ResponseWriter, r *http.Request, page compile
 			s.handleError(w, r, http.StatusInternalServerError, err)
 			return
 		}
-		shell = injectLoaderData(shell, jsonBytes)
+		loaderData = jsonBytes
 	} else {
 		s.mu.RLock()
 		jsLoader := s.jsLoaders[page.route.BundleKey]
 		s.mu.RUnlock()
 		if jsLoader != nil {
-			data, err := jsLoader.Run(loaderContextFromRequest(page.route.Pattern, r))
+			data, err := jsLoader.RunWithContext(r.Context(), loaderContextFromRequest(page.route.Pattern, r))
 			if err != nil {
 				s.logger.Error("loader error", "pattern", page.route.Pattern, "err", err)
 				s.handleError(w, r, http.StatusInternalServerError, err)
 				return
 			}
-			shell = injectLoaderData(shell, data)
+			loaderData = data
 		}
+	}
+
+	if s.frontend != nil && (s.devMode || s.frontendSSR != "") {
+		opts := frontend.RenderOptions{
+			SSREntry:     s.frontendSSR,
+			URL:          r.URL.RequestURI(),
+			RoutePattern: page.route.Pattern,
+			Status:       status,
+			Shell:        page.shell,
+			LoaderData:   loaderData,
+		}
+
+		if se, ok := s.frontend.(frontend.StreamingEngine); ok {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(status)
+			if err := se.RenderStream(r.Context(), s.appDir, opts, w); err != nil {
+				s.logger.Error("streaming render error", "pattern", page.route.Pattern, "err", err)
+			}
+			return
+		}
+
+		rendered, err := s.frontend.Render(r.Context(), s.appDir, opts)
+		if err != nil {
+			s.logger.Error("frontend render error", "pattern", page.route.Pattern, "err", err)
+			s.handleError(w, r, http.StatusInternalServerError, err)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, rendered.HTML)
+		return
+	}
+
+	shell := page.shell
+	if loaderData != nil {
+		shell = injectLoaderData(shell, loaderData)
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
 	_, _ = io.WriteString(w, shell)
+}
+
+func (s *Server) handleLoaderData(w http.ResponseWriter, r *http.Request, page compiledPage) {
+	stripped := strings.TrimPrefix(r.URL.Path, "/_echo/data")
+	if stripped == "" {
+		stripped = "/"
+	}
+	loaderReq := r.Clone(r.Context())
+	loaderReq.URL.Path = stripped
+	loaderReq.RequestURI = stripped
+	if r.URL.RawQuery != "" {
+		loaderReq.RequestURI = stripped + "?" + r.URL.RawQuery
+	}
+
+	var jsonData json.RawMessage
+
+	if fn, ok := s.goLoaders[page.route.Pattern]; ok {
+		data, err := fn(loaderReq)
+		if err != nil {
+			s.logger.Error("data endpoint loader error", "pattern", page.route.Pattern, "err", err)
+			http.Error(w, `{"error":"internal server error"}`, http.StatusInternalServerError)
+			return
+		}
+		var merr error
+		jsonData, merr = json.Marshal(data)
+		if merr != nil {
+			s.logger.Error("data endpoint marshal error", "pattern", page.route.Pattern, "err", merr)
+			http.Error(w, `{"error":"internal server error"}`, http.StatusInternalServerError)
+			return
+		}
+	} else {
+		s.mu.RLock()
+		jsLoader := s.jsLoaders[page.route.BundleKey]
+		s.mu.RUnlock()
+		if jsLoader != nil {
+			raw, err := jsLoader.RunWithContext(r.Context(), loaderContextFromRequest(page.route.Pattern, r))
+			if err != nil {
+				s.logger.Error("data endpoint loader error", "pattern", page.route.Pattern, "err", err)
+				http.Error(w, `{"error":"internal server error"}`, http.StatusInternalServerError)
+				return
+			}
+			jsonData = raw
+		}
+	}
+
+	if jsonData == nil {
+		jsonData = json.RawMessage("null")
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(jsonData)
 }
 
 // ---------------------------------------------------------------------------
@@ -1041,6 +1280,25 @@ func (s *Server) handleError(w http.ResponseWriter, r *http.Request, status int,
 		Path:    r.URL.Path,
 		Status:  status,
 	})
+
+	if s.frontend != nil && (s.devMode || s.frontendSSR != "") {
+		rendered, renderErr := s.frontend.Render(r.Context(), s.appDir, frontend.RenderOptions{
+			SSREntry:     s.frontendSSR,
+			URL:          r.URL.RequestURI(),
+			RoutePattern: errorPage.route.Pattern,
+			Status:       status,
+			Shell:        errorPage.shell,
+			LoaderData:   data,
+		})
+		if renderErr == nil {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(status)
+			_, _ = io.WriteString(w, rendered.HTML)
+			return
+		}
+		s.logger.Error("frontend error render failed", "pattern", errorPage.route.Pattern, "err", renderErr)
+	}
+
 	shell := injectLoaderData(errorPage.shell, data)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
@@ -1086,7 +1344,7 @@ func (s *Server) handleAPIRunner(w http.ResponseWriter, r *http.Request, pattern
 		Headers:      headerToMap(r.Header),
 		Body:         body,
 	}
-	resp, err := run.Run(req)
+	resp, err := run.RunWithContext(r.Context(), req)
 	if err != nil {
 		s.logger.Error("api handler error", "pattern", pattern, "err", err)
 		http.Error(w, "api handler error", http.StatusInternalServerError)
@@ -1106,7 +1364,7 @@ func (s *Server) handleAPIRunner(w http.ResponseWriter, r *http.Request, pattern
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	_, _ = fmt.Fprintf(w, `{"status":"ok","version":%q}`, version)
+	_, _ = fmt.Fprintf(w, `{"status":"ok","version":%q}`, Version)
 }
 
 func (s *Server) handleBundle(w http.ResponseWriter, r *http.Request) {
@@ -1193,6 +1451,32 @@ func injectLoaderData(shell string, data json.RawMessage) string {
 	return strings.Replace(shell, "</body>", script+"\n</body>", 1)
 }
 
+func safeJoinUnder(root, rel string) (string, error) {
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+
+	normalizedRel := filepath.Clean(filepath.FromSlash(rel))
+	if normalizedRel == "." {
+		normalizedRel = ""
+	}
+	if filepath.IsAbs(normalizedRel) {
+		return "", fmt.Errorf("absolute path %q is not allowed", rel)
+	}
+
+	target := filepath.Clean(filepath.Join(absRoot, normalizedRel))
+	relative, err := filepath.Rel(absRoot, target)
+	if err != nil {
+		return "", err
+	}
+	if relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("path %q escapes root", rel)
+	}
+
+	return target, nil
+}
+
 func loaderContextFromRequest(pattern string, r *http.Request) loader.Context {
 	return loader.Context{
 		Params:       extractPathParams(pattern, r),
@@ -1237,6 +1521,17 @@ type gzipResponseWriter struct {
 
 func (g gzipResponseWriter) Write(b []byte) (int, error) {
 	return g.gz.Write(b)
+}
+
+// securityHeadersMiddleware sets conservative security headers on every
+// response. Individual headers can be overridden via echo.config.json/ts.
+func securityHeadersMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "SAMEORIGIN")
+		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		next.ServeHTTP(w, r)
+	})
 }
 
 func headersMiddleware(headers map[string]string) func(http.Handler) http.Handler {
@@ -1374,6 +1669,85 @@ func readPageMeta(pageFilePath, pattern string) (title, description string) {
 		title = titleFromPattern(pattern)
 	}
 	return
+}
+
+func detectSSREntry(appDir string) string {
+	candidates := []string{
+		"src/entry-server.tsx",
+		"src/entry.server.tsx",
+		"entry-server.tsx",
+		"entry.server.tsx",
+	}
+	for _, rel := range candidates {
+		abs := filepath.Join(appDir, rel)
+		if info, err := os.Stat(abs); err == nil && !info.IsDir() {
+			return filepath.ToSlash(rel)
+		}
+	}
+	return ""
+}
+
+func loaderRunnerOptionsFromConfig(cfg config.Config) loader.RunnerOptions {
+	return loader.RunnerOptions{
+		Timeouts: loader.RunnerTimeouts{
+			API:    time.Duration(cfg.JS.APITimeoutMs) * time.Millisecond,
+			Paths:  time.Duration(cfg.JS.PathsTimeoutMs) * time.Millisecond,
+			Loader: time.Duration(cfg.JS.LoaderTimeoutMs) * time.Millisecond,
+		},
+	}
+}
+
+func detectBuiltSSREntry(appDir, serverOutDir, sourceEntry string) (string, error) {
+	outDir := serverOutDir
+	if !filepath.IsAbs(outDir) {
+		outDir = filepath.Join(appDir, outDir)
+	}
+	outDir = filepath.Clean(outDir)
+
+	base := strings.TrimSuffix(filepath.Base(sourceEntry), filepath.Ext(sourceEntry))
+	exts := []string{".js", ".mjs", ".cjs"}
+
+	for _, ext := range exts {
+		candidate := filepath.Join(outDir, base+ext)
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			rel, err := filepath.Rel(appDir, candidate)
+			if err != nil {
+				return "", err
+			}
+			return filepath.ToSlash(rel), nil
+		}
+	}
+
+	var firstMatch string
+	walkErr := filepath.Walk(outDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+
+		name := info.Name()
+		for _, ext := range exts {
+			if name == base+ext {
+				firstMatch = path
+				return io.EOF
+			}
+		}
+		return nil
+	})
+	if walkErr != nil && !errors.Is(walkErr, io.EOF) {
+		return "", walkErr
+	}
+	if firstMatch != "" {
+		rel, err := filepath.Rel(appDir, firstMatch)
+		if err != nil {
+			return "", err
+		}
+		return filepath.ToSlash(rel), nil
+	}
+
+	return "", fmt.Errorf("no built ssr entry found in %s for source %s", filepath.ToSlash(serverOutDir), sourceEntry)
 }
 
 func (s *Server) syncWatchedDirs() {

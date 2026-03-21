@@ -14,7 +14,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/echo-ssr/echo/internal/config"
 	"github.com/echo-ssr/echo/internal/loader"
 	"github.com/echo-ssr/echo/internal/router"
 )
@@ -232,6 +234,26 @@ func TestReadPageMeta(t *testing.T) {
 			t.Errorf("title = %q, want %q", title, "Home")
 		}
 	})
+}
+
+func TestLoaderRunnerOptionsFromConfig(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Defaults()
+	cfg.JS.LoaderTimeoutMs = 2500
+	cfg.JS.APITimeoutMs = 4000
+	cfg.JS.PathsTimeoutMs = 6000
+
+	opts := loaderRunnerOptionsFromConfig(cfg)
+	if opts.Timeouts.Loader != 2500*time.Millisecond {
+		t.Fatalf("loader timeout = %s, want %s", opts.Timeouts.Loader, 2500*time.Millisecond)
+	}
+	if opts.Timeouts.API != 4000*time.Millisecond {
+		t.Fatalf("api timeout = %s, want %s", opts.Timeouts.API, 4000*time.Millisecond)
+	}
+	if opts.Timeouts.Paths != 6000*time.Millisecond {
+		t.Fatalf("paths timeout = %s, want %s", opts.Timeouts.Paths, 6000*time.Millisecond)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -745,6 +767,66 @@ func TestCreateStaticHandler_NoPublicDir(t *testing.T) {
 
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", rec.Code)
+	}
+}
+
+func TestCreateStaticHandler_ServesPublicFile(t *testing.T) {
+	t.Parallel()
+
+	appDir := t.TempDir()
+	publicDir := filepath.Join(appDir, "public")
+	if err := os.MkdirAll(publicDir, 0o755); err != nil {
+		t.Fatalf("mkdir public: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(publicDir, "logo.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatalf("write logo: %v", err)
+	}
+
+	s := &Server{
+		appDir:  appDir,
+		devMode: true,
+	}
+
+	h := s.createStaticHandler(nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/logo.txt", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if body := rec.Body.String(); body != "hello" {
+		t.Fatalf("body = %q, want %q", body, "hello")
+	}
+}
+
+func TestCreateStaticHandler_BlocksAbsolutePathEscape(t *testing.T) {
+	t.Parallel()
+
+	appDir := t.TempDir()
+	publicDir := filepath.Join(appDir, "public")
+	if err := os.MkdirAll(publicDir, 0o755); err != nil {
+		t.Fatalf("mkdir public: %v", err)
+	}
+
+	outsideDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outsideDir, "index.html"), []byte("outside secret"), 0o644); err != nil {
+		t.Fatalf("write outside index: %v", err)
+	}
+
+	s := &Server{
+		appDir:  appDir,
+		devMode: true,
+	}
+
+	h := s.createStaticHandler(nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", outsideDir+"/", nil))
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "outside secret") {
+		t.Fatal("response leaked content from outside public/")
 	}
 }
 
