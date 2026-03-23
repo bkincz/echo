@@ -35,7 +35,7 @@ import (
 )
 
 // Version is the current Echo server version, exposed via the health endpoint.
-const Version = "2.0.0"
+const Version = "2.0.1"
 
 // ---------------------------------------------------------------------------
 // Types
@@ -138,6 +138,8 @@ type Server struct {
 	apiRunners  map[string]*loader.APIRunner
 	handler     http.Handler
 	chain       http.Handler
+	core        http.Handler
+	middleware  []func(http.Handler) http.Handler
 	logger      *slog.Logger
 	compiler    *bundler.Compiler
 	goLoaders   map[string]LoaderFunc
@@ -191,18 +193,29 @@ func (s *Server) initServer(opts ServerOptions) {
 	}
 	s.logger = opts.Logger
 
-	core := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	s.core = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.mu.RLock()
 		h := s.handler
 		s.mu.RUnlock()
 		h.ServeHTTP(w, r)
 	})
+	s.middleware = append(s.middleware, opts.Middleware...)
+	s.rebuildChain()
+}
+
+func (s *Server) rebuildChain() {
 	mw := []func(http.Handler) http.Handler{gzipMiddleware, securityHeadersMiddleware}
 	if len(s.cfg.Headers) > 0 {
 		mw = append(mw, headersMiddleware(s.cfg.Headers))
 	}
-	mw = append(mw, opts.Middleware...)
-	s.chain = s.recoverMiddleware(createChain(core, mw))
+	mw = append(mw, s.middleware...)
+	s.chain = s.recoverMiddleware(createChain(s.core, mw))
+}
+
+func (s *Server) Use(mw ...func(http.Handler) http.Handler) *Server {
+	s.middleware = append(s.middleware, mw...)
+	s.rebuildChain()
+	return s
 }
 
 func New(appDir string, devMode bool, opts ...ServerOptions) (*Server, error) {

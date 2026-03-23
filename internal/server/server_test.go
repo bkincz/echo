@@ -945,3 +945,52 @@ func TestRecoverMiddleware_PanicRendersErrorPage(t *testing.T) {
 		t.Error("expected error page HTML with __echo_data__")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Use
+// ---------------------------------------------------------------------------
+func TestUse(t *testing.T) {
+	t.Parallel()
+
+	s := &Server{
+		goLoaders:  make(map[string]LoaderFunc),
+		goPaths:    make(map[string]PathsFunc),
+		goHandlers: make(map[string]http.Handler),
+		handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}),
+	}
+	s.initServer(ServerOptions{Logger: slog.Default()})
+
+	var called []string
+	tag := func(name string) func(http.Handler) http.Handler {
+		return func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				called = append(called, name)
+				next.ServeHTTP(w, r)
+			})
+		}
+	}
+
+	t.Run("runs in registration order", func(t *testing.T) {
+		called = nil
+		s.Use(tag("a"), tag("b"))
+		s.Use(tag("c"))
+
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Header.Set("Accept-Encoding", "")
+		s.ServeHTTP(httptest.NewRecorder(), req)
+
+		want := []string{"a", "b", "c"}
+		if fmt.Sprint(called) != fmt.Sprint(want) {
+			t.Errorf("middleware order = %v, want %v", called, want)
+		}
+	})
+
+	t.Run("returns server for chaining", func(t *testing.T) {
+		nop := func(next http.Handler) http.Handler { return next }
+		if got := s.Use(nop); got != s {
+			t.Error("Use() should return the server for chaining")
+		}
+	})
+}
