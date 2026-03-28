@@ -35,7 +35,7 @@ import (
 )
 
 // Version is the current Echo server version, exposed via the health endpoint.
-const Version = "2.0.1"
+const Version = "2.0.2"
 
 // ---------------------------------------------------------------------------
 // Types
