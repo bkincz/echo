@@ -70,7 +70,7 @@ func BuildStatic(appDir string, opts ...BuildOptions) error {
 		}
 	}()
 
-	pagesDir := filepath.Join(abs, "pages")
+	pagesDir := filepath.Join(abs, filepath.FromSlash(cfg.Paths.PagesDir))
 	loaderFiles, _ := loader.Find(pagesDir)
 	jsLoaders := make(map[string]*loader.Loader, len(loaderFiles))
 	runnerOpts := loaderRunnerOptionsFromConfig(cfg)
@@ -91,7 +91,7 @@ func BuildStatic(appDir string, opts ...BuildOptions) error {
 			return err
 		}
 		for _, params := range pathEntries {
-			if err := writeStaticPage(abs, distDir, mr, params, jsLoaders, goLoaders, engine, m.Frontend.SSREntry, logger); err != nil {
+			if err := writeStaticPage(abs, distDir, cfg.BasePath, mr, params, jsLoaders, goLoaders, engine, m.Frontend.SSREntry, logger); err != nil {
 				return err
 			}
 		}
@@ -137,7 +137,7 @@ func resolvePathEntries(
 }
 
 func writeStaticPage(
-	appDir, distDir string,
+	appDir, distDir, basePath string,
 	mr manifestRoute,
 	params map[string]string,
 	jsLoaders map[string]*loader.Loader,
@@ -148,13 +148,14 @@ func writeStaticPage(
 ) error {
 	cssBundleURL := ""
 	if mr.HasCSS {
-		cssBundleURL = "/_echo/bundle/" + mr.BundleID + ".css"
+		cssBundleURL = prefixURLPath(basePath, "/_echo/bundle/"+mr.BundleID+".css")
 	}
 	shell, err := renderer.Shell(renderer.ShellOptions{
 		Title:        mr.Title,
 		Description:  mr.Description,
-		BundleURL:    "/_echo/bundle/" + mr.BundleID + ".js",
+		BundleURL:    prefixURLPath(basePath, "/_echo/bundle/"+mr.BundleID+".js"),
 		CSSBundleURL: cssBundleURL,
+		SSEURL:       prefixURLPath(basePath, "/_echo/sse"),
 	})
 	if err != nil {
 		return fmt.Errorf("rendering shell for %s: %w", mr.Pattern, err)

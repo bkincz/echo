@@ -19,6 +19,7 @@ import (
 
 type Options struct {
 	AppDir       string
+	ClientEntry  string
 	Minify       bool
 	CSSTransform func(css string) (string, error)
 	Plugins      []api.Plugin
@@ -46,7 +47,7 @@ type Compiler struct {
 // Compiler
 // ---------------------------------------------------------------------------
 func NewCompiler(opts Options) (*Compiler, error) {
-	entry, err := findClientEntry(opts.AppDir)
+	entry, err := findClientEntry(opts.AppDir, opts.ClientEntry)
 	if err != nil {
 		return nil, err
 	}
@@ -246,7 +247,25 @@ func parseInputs(metaJSON string, appDir string) ([]string, error) {
 	return inputs, nil
 }
 
-func findClientEntry(appDir string) (string, error) {
+func findClientEntry(appDir, configured string) (string, error) {
+	if configured != "" {
+		abs := configured
+		if !filepath.IsAbs(abs) {
+			abs = filepath.Join(appDir, filepath.FromSlash(configured))
+		}
+		info, err := os.Stat(abs)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return "", fmt.Errorf("configured client entry %q was not found", configured)
+			}
+			return "", fmt.Errorf("checking configured client entry %s: %w", abs, err)
+		}
+		if info.IsDir() {
+			return "", fmt.Errorf("configured client entry %q must be a file", configured)
+		}
+		return filepath.ToSlash(abs), nil
+	}
+
 	candidates := []string{
 		"client.tsx",
 		"client.ts",

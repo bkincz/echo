@@ -272,3 +272,50 @@ func TestBuildStaticRejectsPathTraversalFromDynamicParams(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+func TestBuildStaticUsesConfiguredPagesDir(t *testing.T) {
+	appDir := createSmokeApp(t)
+
+	oldPagesDir := filepath.Join(appDir, "pages")
+	newPagesDir := filepath.Join(appDir, "src", "pages")
+	if err := os.MkdirAll(filepath.Dir(newPagesDir), 0o755); err != nil {
+		t.Fatalf("mkdir src: %v", err)
+	}
+	if err := os.Rename(oldPagesDir, newPagesDir); err != nil {
+		t.Fatalf("move pages dir: %v", err)
+	}
+
+	cfg := []byte(`{"paths":{"pagesDir":"src/pages"}}`)
+	if err := os.WriteFile(filepath.Join(appDir, "echo.config.json"), cfg, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	fake := &fakeFrontendEngine{}
+	err := BuildStatic(appDir, BuildOptions{
+		Logger:           discardLogger(),
+		Frontend:         fake,
+		FrontendSSREntry: "src/entry-server.tsx",
+		GoPaths: map[string]PathsFunc{
+			"/blog/{id}": func() ([]map[string]string, error) {
+				return []map[string]string{{"id": "configured"}}, nil
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("BuildStatic: %v", err)
+	}
+
+	if fake.renderCalls == 0 {
+		t.Fatal("expected at least one render call")
+	}
+
+	for _, rel := range []string{
+		"dist/index.html",
+		"dist/blog/configured/index.html",
+	} {
+		full := filepath.Join(appDir, rel)
+		if _, err := os.Stat(full); err != nil {
+			t.Fatalf("expected %s to exist: %v", rel, err)
+		}
+	}
+}

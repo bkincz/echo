@@ -168,6 +168,83 @@ func (s *Server) Loader(pattern string, fn LoaderFunc) *Server {
 	return s
 }
 
+func (s *Server) pagesDir() string {
+	dir := s.cfg.Paths.PagesDir
+	if dir == "" {
+		dir = config.Defaults().Paths.PagesDir
+	}
+	return filepath.Join(s.appDir, filepath.FromSlash(dir))
+}
+
+func (s *Server) basePath() string {
+	return config.NormalizeBasePath(s.cfg.BasePath)
+}
+
+func (s *Server) publicDir() string {
+	dir := s.cfg.Paths.PublicDir
+	if dir == "" {
+		dir = config.Defaults().Paths.PublicDir
+	}
+	return filepath.Join(s.appDir, filepath.FromSlash(dir))
+}
+
+func prefixURLPath(basePath, target string) string {
+	basePath = config.NormalizeBasePath(basePath)
+	if target == "" {
+		target = "/"
+	}
+	if !strings.HasPrefix(target, "/") {
+		target = "/" + target
+	}
+	if basePath == "" {
+		return target
+	}
+	if target == "/" {
+		return basePath
+	}
+	return basePath + target
+}
+
+func stripBasePath(basePath, target string) string {
+	basePath = config.NormalizeBasePath(basePath)
+	if target == "" {
+		return "/"
+	}
+	if basePath == "" {
+		return target
+	}
+	if target == basePath || target == basePath+"/" {
+		return "/"
+	}
+	if strings.HasPrefix(target, basePath+"/") {
+		return strings.TrimPrefix(target, basePath)
+	}
+	return target
+}
+
+func (s *Server) routePath(target string) string {
+	return prefixURLPath(s.basePath(), target)
+}
+
+func (s *Server) routeRequestURI(r *http.Request) string {
+	path := stripBasePath(s.basePath(), r.URL.Path)
+	if r.URL.RawQuery == "" {
+		return path
+	}
+	return path + "?" + r.URL.RawQuery
+}
+
+func (s *Server) routePattern(pattern string) string {
+	if !strings.Contains(pattern, " ") {
+		return s.routePath(pattern)
+	}
+	method, pathPattern, ok := strings.Cut(pattern, " ")
+	if !ok {
+		return pattern
+	}
+	return method + " " + s.routePath(pathPattern)
+}
+
 // ---------------------------------------------------------------------------
 // Constructors
 // ---------------------------------------------------------------------------
@@ -204,7 +281,7 @@ func (s *Server) initServer(opts ServerOptions) {
 }
 
 func (s *Server) rebuildChain() {
-	mw := []func(http.Handler) http.Handler{gzipMiddleware, securityHeadersMiddleware}
+	mw := []func(http.Handler) http.Handler{gzipMiddlewareWithBasePath(s.basePath()), securityHeadersMiddleware}
 	if len(s.cfg.Headers) > 0 {
 		mw = append(mw, headersMiddleware(s.cfg.Headers))
 	}
@@ -238,9 +315,12 @@ func New(appDir string, devMode bool, opts ...ServerOptions) (*Server, error) {
 	}
 
 	compilerOpts := bundler.Options{
-		AppDir:  abs,
-		Minify:  !devMode,
-		Plugins: append([]esbuild.Plugin{plugins.EchoPages(abs)}, opt.Plugins...),
+		AppDir:      abs,
+		ClientEntry: cfg.Frontend.ClientEntry,
+		Minify:      !devMode,
+		Plugins: append([]esbuild.Plugin{
+			plugins.EchoPages(abs, filepath.Join(abs, filepath.FromSlash(cfg.Paths.PagesDir)), cfg.BasePath),
+		}, opt.Plugins...),
 	}
 	if lc := plugins.FindLightningCSS(abs); lc != "" {
 		opt.Logger.Info("CSS: Lightning CSS enabled")
@@ -266,6 +346,9 @@ func New(appDir string, devMode bool, opts ...ServerOptions) (*Server, error) {
 		frontend:    resolveFrontendEngine(opt.Frontend, opt.Logger, opt.FrontendWorkers),
 		frontendDev: opt.FrontendDev,
 		frontendSSR: opt.FrontendSSREntry,
+	}
+	if s.frontendSSR == "" {
+		s.frontendSSR = cfg.Frontend.SSREntry
 	}
 	s.buildJSLoaders()
 	s.buildAPIRunners()
@@ -313,13 +396,14 @@ func NewProduction(appDir string, opts ...ServerOptions) (*Server, error) {
 	for _, mr := range m.Routes {
 		cssBundleURL := ""
 		if mr.HasCSS {
-			cssBundleURL = "/_echo/bundle/" + mr.BundleID + ".css"
+			cssBundleURL = prefixURLPath(cfg.BasePath, "/_echo/bundle/"+mr.BundleID+".css")
 		}
 		shell, err := renderer.Shell(renderer.ShellOptions{
 			Title:        mr.Title,
 			Description:  mr.Description,
-			BundleURL:    "/_echo/bundle/" + mr.BundleID + ".js",
+			BundleURL:    prefixURLPath(cfg.BasePath, "/_echo/bundle/"+mr.BundleID+".js"),
 			CSSBundleURL: cssBundleURL,
+			SSEURL:       prefixURLPath(cfg.BasePath, "/_echo/sse"),
 			DevMode:      false,
 		})
 		if err != nil {
@@ -354,6 +438,9 @@ func NewProduction(appDir string, opts ...ServerOptions) (*Server, error) {
 		frontendDev: opt.FrontendDev,
 		frontendSSR: opt.FrontendSSREntry,
 	}
+	if s.frontendSSR == "" {
+		s.frontendSSR = cfg.Frontend.SSREntry
+	}
 	if s.frontendSSR == "" && m.Frontend != nil {
 		s.frontendSSR = m.Frontend.SSREntry
 	}
@@ -386,7 +473,7 @@ func (s *Server) rebuild() error {
 }
 
 func (s *Server) rebuildAllLocked() error {
-	pagesDir := filepath.Join(s.appDir, "pages")
+	pagesDir := s.pagesDir()
 	routes, err := router.Scan(pagesDir)
 	if err != nil {
 		return fmt.Errorf("scanning pages: %w", err)
@@ -395,7 +482,7 @@ func (s *Server) rebuildAllLocked() error {
 }
 
 func (s *Server) compileAndSwapLocked(routes []router.Route) error {
-	pagesDir := filepath.Join(s.appDir, "pages")
+	pagesDir := s.pagesDir()
 	layoutMap, _ := layout.Find(pagesDir)
 
 	results := make([]buildResult, len(routes))
@@ -414,13 +501,14 @@ func (s *Server) compileAndSwapLocked(routes []router.Route) error {
 			title, description := readPageMeta(route.FilePath, route.Pattern)
 			cssBundleURL := ""
 			if b.CSS != "" {
-				cssBundleURL = "/_echo/bundle/" + id + ".css"
+				cssBundleURL = s.routePath("/_echo/bundle/" + id + ".css")
 			}
 			shell, err := renderer.Shell(renderer.ShellOptions{
 				Title:        title,
 				Description:  description,
-				BundleURL:    "/_echo/bundle/" + id + ".js",
+				BundleURL:    s.routePath("/_echo/bundle/" + id + ".js"),
 				CSSBundleURL: cssBundleURL,
+				SSEURL:       s.routePath("/_echo/sse"),
 				DevMode:      s.devMode,
 			})
 			if err != nil {
@@ -470,7 +558,7 @@ func (s *Server) compileAndSwapLocked(routes []router.Route) error {
 }
 
 func (s *Server) buildAPIRunners() {
-	pagesDir := filepath.Join(s.appDir, "pages")
+	pagesDir := s.pagesDir()
 	routes, err := router.ScanAPI(pagesDir)
 	if err != nil {
 		s.logger.Warn("scanning api routes", "err", err)
@@ -494,7 +582,7 @@ func (s *Server) buildAPIRunners() {
 }
 
 func (s *Server) buildJSLoaders() {
-	pagesDir := filepath.Join(s.appDir, "pages")
+	pagesDir := s.pagesDir()
 	found, err := loader.Find(pagesDir)
 	if err != nil {
 		s.logger.Warn("scanning loaders", "err", err)
@@ -528,7 +616,7 @@ func (s *Server) handleChanges(paths []string) error {
 	s.rebuildMu.Lock()
 	defer s.rebuildMu.Unlock()
 
-	pagesDir := filepath.Join(s.appDir, "pages")
+	pagesDir := s.pagesDir()
 	routes, err := router.Scan(pagesDir)
 	if err != nil {
 		return fmt.Errorf("scanning pages: %w", err)
@@ -591,13 +679,14 @@ func (s *Server) handleChanges(paths []string) error {
 			title, description := readPageMeta(page.route.FilePath, page.route.Pattern)
 			cssBundleURL := ""
 			if b.CSS != "" {
-				cssBundleURL = "/_echo/bundle/" + id + ".css"
+				cssBundleURL = s.routePath("/_echo/bundle/" + id + ".css")
 			}
 			shell, err := renderer.Shell(renderer.ShellOptions{
 				Title:        title,
 				Description:  description,
-				BundleURL:    "/_echo/bundle/" + id + ".js",
+				BundleURL:    s.routePath("/_echo/bundle/" + id + ".js"),
 				CSSBundleURL: cssBundleURL,
+				SSEURL:       s.routePath("/_echo/sse"),
 				DevMode:      s.devMode,
 			})
 			if err != nil {
@@ -664,28 +753,29 @@ func (s *Server) handleChanges(paths []string) error {
 func (s *Server) createMux(pages []compiledPage) *http.ServeMux {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("GET /_echo/health", s.handleHealth)
+	mux.HandleFunc(s.routePattern("GET /_echo/health"), s.handleHealth)
 
 	for pattern, h := range s.goHandlers {
-		mux.Handle(pattern, h)
+		mux.Handle(s.routePattern(pattern), h)
 	}
 
 	s.mu.RLock()
 	for pat, run := range s.apiRunners {
 		pat, run := pat, run
-		mux.HandleFunc(pat, func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc(s.routePattern(pat), func(w http.ResponseWriter, r *http.Request) {
 			s.handleAPIRunner(w, r, pat, run)
 		})
 	}
 	s.mu.RUnlock()
 
 	if s.devMode {
-		mux.HandleFunc("GET /_echo/bundle/", s.handleBundle)
-		mux.HandleFunc("GET /_echo/sse", s.handleSSE)
+		mux.HandleFunc(s.routePattern("GET /_echo/bundle/"), s.handleBundle)
+		mux.HandleFunc(s.routePattern("GET /_echo/sse"), s.handleSSE)
 	} else {
 		bundleDir := filepath.Join(s.appDir, "dist", "_echo", "bundle")
-		bundleServer := http.StripPrefix("/_echo/bundle/", http.FileServer(noDirListingFS{http.Dir(bundleDir)}))
-		mux.Handle("GET /_echo/bundle/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bundlePrefix := s.routePath("/_echo/bundle/")
+		bundleServer := http.StripPrefix(bundlePrefix, http.FileServer(noDirListingFS{http.Dir(bundleDir)}))
+		mux.Handle(s.routePattern("GET /_echo/bundle/"), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 			if strings.HasSuffix(r.URL.Path, ".css") {
 				w.Header().Set("Content-Type", "text/css; charset=utf-8")
@@ -698,9 +788,12 @@ func (s *Server) createMux(pages []compiledPage) *http.ServeMux {
 
 	for _, p := range pages {
 		cp := p
-		pattern := "GET " + cp.route.Pattern
+		pattern := "GET " + s.routePath(cp.route.Pattern)
 		if cp.route.Pattern == "/" {
-			pattern = "GET /{$}"
+			pattern = "GET " + s.routePath("/{$}")
+			mux.HandleFunc("GET "+s.routePath("/"), func(w http.ResponseWriter, r *http.Request) {
+				s.handlePage(w, r, cp, http.StatusOK)
+			})
 		}
 		mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
 			s.handlePage(w, r, cp, http.StatusOK)
@@ -709,21 +802,25 @@ func (s *Server) createMux(pages []compiledPage) *http.ServeMux {
 
 	for _, p := range pages {
 		cp := p
-		dataPattern := "GET /_echo/data" + cp.route.Pattern
+		dataPattern := "GET " + s.routePath("/_echo/data"+cp.route.Pattern)
 		if cp.route.Pattern == "/" {
-			dataPattern = "GET /_echo/data/{$}"
+			dataPattern = "GET " + s.routePath("/_echo/data/{$}")
 		}
 		mux.HandleFunc(dataPattern, func(w http.ResponseWriter, r *http.Request) {
 			s.handleLoaderData(w, r, cp)
 		})
 	}
 
-	mux.Handle("GET /", s.createStaticHandler(pages))
+	if s.basePath() == "" {
+		mux.Handle("GET /", s.createStaticHandler(pages))
+	} else {
+		mux.Handle("GET "+s.routePath("/")+"/", s.createStaticHandler(pages))
+	}
 	return mux
 }
 
 func (s *Server) createStaticHandler(pages []compiledPage) http.Handler {
-	publicDir := filepath.Join(s.appDir, "public")
+	publicDir := s.publicDir()
 	if !s.devMode {
 		publicDir = filepath.Join(s.appDir, "dist", "public")
 	}
@@ -750,7 +847,7 @@ func (s *Server) createStaticHandler(pages []compiledPage) http.Handler {
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		cleanPath := path.Clean("/" + r.URL.Path)
+		cleanPath := path.Clean("/" + stripBasePath(s.basePath(), r.URL.Path))
 		relPath := strings.TrimPrefix(cleanPath, "/")
 		fpath, err := safeJoinUnder(publicDir, relPath)
 		if err != nil {
@@ -855,8 +952,8 @@ func (s *Server) Start(addr string) error {
 	}
 
 	if s.devMode {
-		pagesDir := filepath.Join(s.appDir, "pages")
-		publicDir := filepath.Join(s.appDir, "public")
+		pagesDir := s.pagesDir()
+		publicDir := s.publicDir()
 
 		w, err := watcher.New(func(paths []string) {
 			go func() {
@@ -940,6 +1037,11 @@ type frontendBuildResult struct {
 }
 
 func runFrontendBuild(appDir string, logger *slog.Logger, opts BuildOptions) (frontendBuildResult, error) {
+	cfg, err := config.Load(appDir)
+	if err != nil {
+		return frontendBuildResult{}, fmt.Errorf("loading config: %w", err)
+	}
+
 	engine := resolveFrontendEngine(opts.Frontend, logger, 0)
 	if engine == nil {
 		return frontendBuildResult{}, nil
@@ -959,7 +1061,7 @@ func runFrontendBuild(appDir string, logger *slog.Logger, opts BuildOptions) (fr
 	}
 	ssrSourceEntry := opts.FrontendSSREntry
 	if ssrSourceEntry == "" {
-		ssrSourceEntry = detectSSREntry(appDir)
+		ssrSourceEntry = detectSSREntry(appDir, cfg)
 	}
 	if ssrSourceEntry == "" {
 		return frontendBuildResult{}, fmt.Errorf("frontend ssr entry not found (expected one of: src/entry-server.tsx, src/entry.server.tsx, entry-server.tsx, entry.server.tsx)")
@@ -1004,6 +1106,11 @@ func Build(appDir string, opts ...BuildOptions) error {
 		return err
 	}
 
+	cfg, err := config.Load(abs)
+	if err != nil {
+		return fmt.Errorf("loading config: %w", err)
+	}
+
 	distDir := filepath.Join(abs, "dist")
 	if err := os.RemoveAll(distDir); err != nil {
 		return fmt.Errorf("cleaning dist/: %w", err)
@@ -1026,9 +1133,10 @@ func Build(appDir string, opts ...BuildOptions) error {
 	}
 
 	buildOpts := bundler.Options{
-		AppDir:  abs,
-		Minify:  true,
-		Plugins: userPlugins,
+		AppDir:      abs,
+		ClientEntry: cfg.Frontend.ClientEntry,
+		Minify:      true,
+		Plugins:     userPlugins,
 	}
 	if lc := plugins.FindLightningCSS(abs); lc != "" {
 		logger.Info("CSS: Lightning CSS enabled")
@@ -1040,7 +1148,7 @@ func Build(appDir string, opts ...BuildOptions) error {
 	}
 	defer compiler.Close()
 
-	pagesDir := filepath.Join(abs, "pages")
+	pagesDir := filepath.Join(abs, filepath.FromSlash(cfg.Paths.PagesDir))
 	routes, err := router.Scan(pagesDir)
 	if err != nil {
 		return fmt.Errorf("scanning pages: %w", err)
@@ -1120,7 +1228,7 @@ func Build(appDir string, opts ...BuildOptions) error {
 	}
 	logger.Info("wrote manifest", "file", "dist/manifest.json")
 
-	srcPublic := filepath.Join(abs, "public")
+	srcPublic := filepath.Join(abs, filepath.FromSlash(cfg.Paths.PublicDir))
 	if info, err := os.Stat(srcPublic); err == nil && info.IsDir() {
 		dstPublic := filepath.Join(distDir, "public")
 		if err := copyDir(srcPublic, dstPublic); err != nil {
@@ -1170,7 +1278,7 @@ func (s *Server) handlePage(w http.ResponseWriter, r *http.Request, page compile
 	if s.frontend != nil && (s.devMode || s.frontendSSR != "") {
 		opts := frontend.RenderOptions{
 			SSREntry:     s.frontendSSR,
-			URL:          r.URL.RequestURI(),
+			URL:          s.routeRequestURI(r),
 			RoutePattern: page.route.Pattern,
 			Status:       status,
 			Shell:        page.shell,
@@ -1209,7 +1317,7 @@ func (s *Server) handlePage(w http.ResponseWriter, r *http.Request, page compile
 }
 
 func (s *Server) handleLoaderData(w http.ResponseWriter, r *http.Request, page compiledPage) {
-	stripped := strings.TrimPrefix(r.URL.Path, "/_echo/data")
+	stripped := strings.TrimPrefix(r.URL.Path, s.routePath("/_echo/data"))
 	if stripped == "" {
 		stripped = "/"
 	}
@@ -1290,14 +1398,14 @@ func (s *Server) handleError(w http.ResponseWriter, r *http.Request, status int,
 
 	data, _ := json.Marshal(ErrorContext{
 		Message: err.Error(),
-		Path:    r.URL.Path,
+		Path:    stripBasePath(s.basePath(), r.URL.Path),
 		Status:  status,
 	})
 
 	if s.frontend != nil && (s.devMode || s.frontendSSR != "") {
 		rendered, renderErr := s.frontend.Render(r.Context(), s.appDir, frontend.RenderOptions{
 			SSREntry:     s.frontendSSR,
-			URL:          r.URL.RequestURI(),
+			URL:          s.routeRequestURI(r),
 			RoutePattern: errorPage.route.Pattern,
 			Status:       status,
 			Shell:        errorPage.shell,
@@ -1381,7 +1489,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleBundle(w http.ResponseWriter, r *http.Request) {
-	name := strings.TrimPrefix(r.URL.Path, "/_echo/bundle/")
+	name := strings.TrimPrefix(r.URL.Path, s.routePath("/_echo/bundle/"))
 
 	s.mu.RLock()
 	content, ok := s.bundles[name]
@@ -1559,22 +1667,28 @@ func headersMiddleware(headers map[string]string) func(http.Handler) http.Handle
 }
 
 func gzipMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") || r.URL.Path == "/_echo/sse" {
-			next.ServeHTTP(w, r)
-			return
-		}
-		gz, err := gzip.NewWriterLevel(w, gzip.BestSpeed)
-		if err != nil {
-			next.ServeHTTP(w, r)
-			return
-		}
-		defer gz.Close()
-		w.Header().Add("Vary", "Accept-Encoding")
-		w.Header().Set("Content-Encoding", "gzip")
-		w.Header().Del("Content-Length")
-		next.ServeHTTP(gzipResponseWriter{ResponseWriter: w, gz: gz}, r)
-	})
+	return gzipMiddlewareWithBasePath("")(next)
+}
+
+func gzipMiddlewareWithBasePath(basePath string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") || r.URL.Path == prefixURLPath(basePath, "/_echo/sse") {
+				next.ServeHTTP(w, r)
+				return
+			}
+			gz, err := gzip.NewWriterLevel(w, gzip.BestSpeed)
+			if err != nil {
+				next.ServeHTTP(w, r)
+				return
+			}
+			defer gz.Close()
+			w.Header().Add("Vary", "Accept-Encoding")
+			w.Header().Set("Content-Encoding", "gzip")
+			w.Header().Del("Content-Length")
+			next.ServeHTTP(gzipResponseWriter{ResponseWriter: w, gz: gz}, r)
+		})
+	}
 }
 
 func titleFromPattern(pattern string) string {
@@ -1684,13 +1798,17 @@ func readPageMeta(pageFilePath, pattern string) (title, description string) {
 	return
 }
 
-func detectSSREntry(appDir string) string {
-	candidates := []string{
+func detectSSREntry(appDir string, cfg config.Config) string {
+	candidates := []string{}
+	if cfg.Frontend.SSREntry != "" {
+		candidates = append(candidates, filepath.ToSlash(cfg.Frontend.SSREntry))
+	}
+	candidates = append(candidates,
 		"src/entry-server.tsx",
 		"src/entry.server.tsx",
 		"entry-server.tsx",
 		"entry.server.tsx",
-	}
+	)
 	for _, rel := range candidates {
 		abs := filepath.Join(appDir, rel)
 		if info, err := os.Stat(abs); err == nil && !info.IsDir() {

@@ -15,6 +15,15 @@ func TestLoadMissingFile(t *testing.T) {
 	if cfg.Port != 3000 {
 		t.Errorf("port = %d, want 3000", cfg.Port)
 	}
+	if cfg.BasePath != "" {
+		t.Errorf("basePath = %q, want empty", cfg.BasePath)
+	}
+	if cfg.Paths.PagesDir != "pages" {
+		t.Errorf("pagesDir = %q, want %q", cfg.Paths.PagesDir, "pages")
+	}
+	if cfg.Paths.PublicDir != "public" {
+		t.Errorf("publicDir = %q, want %q", cfg.Paths.PublicDir, "public")
+	}
 	if cfg.JS.LoaderTimeoutMs != 10000 || cfg.JS.APITimeoutMs != 10000 || cfg.JS.PathsTimeoutMs != 10000 {
 		t.Errorf("unexpected default js timeouts: %+v", cfg.JS)
 	}
@@ -25,7 +34,16 @@ func TestLoadValid(t *testing.T) {
 	dir := t.TempDir()
 	writeJSON(t, filepath.Join(dir, "echo.config.json"), `{
 		"port": 8080,
+		"basePath": "/admin/",
 		"headers": {"X-Frame-Options": "DENY"},
+		"paths": {
+			"pagesDir": "src/pages",
+			"publicDir": "assets"
+		},
+		"frontend": {
+			"clientEntry": "src/client.tsx",
+			"ssrEntry": "src/server/entry.tsx"
+		},
 		"js": {
 			"loaderTimeoutMs": 2500,
 			"apiTimeoutMs": 7000,
@@ -40,11 +58,63 @@ func TestLoadValid(t *testing.T) {
 	if cfg.Port != 8080 {
 		t.Errorf("port = %d, want 8080", cfg.Port)
 	}
+	if cfg.BasePath != "/admin" {
+		t.Errorf("basePath = %q, want %q", cfg.BasePath, "/admin")
+	}
 	if cfg.Headers["X-Frame-Options"] != "DENY" {
 		t.Errorf("header X-Frame-Options = %q, want DENY", cfg.Headers["X-Frame-Options"])
 	}
+	if cfg.Paths.PagesDir != "src/pages" {
+		t.Errorf("pagesDir = %q, want %q", cfg.Paths.PagesDir, "src/pages")
+	}
+	if cfg.Paths.PublicDir != "assets" {
+		t.Errorf("publicDir = %q, want %q", cfg.Paths.PublicDir, "assets")
+	}
+	if cfg.Frontend.ClientEntry != "src/client.tsx" {
+		t.Errorf("clientEntry = %q, want %q", cfg.Frontend.ClientEntry, "src/client.tsx")
+	}
+	if cfg.Frontend.SSREntry != "src/server/entry.tsx" {
+		t.Errorf("ssrEntry = %q, want %q", cfg.Frontend.SSREntry, "src/server/entry.tsx")
+	}
 	if cfg.JS.LoaderTimeoutMs != 2500 || cfg.JS.APITimeoutMs != 7000 || cfg.JS.PathsTimeoutMs != 9000 {
 		t.Errorf("unexpected js timeouts: %+v", cfg.JS)
+	}
+}
+
+func TestLoadNormalizesBasePath(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	writeJSON(t, filepath.Join(dir, "echo.config.json"), `{
+		"basePath": "admin/nested/"
+	}`)
+
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.BasePath != "/admin/nested" {
+		t.Errorf("basePath = %q, want %q", cfg.BasePath, "/admin/nested")
+	}
+}
+
+func TestLoadMissingPathSettingsUseDefaults(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	writeJSON(t, filepath.Join(dir, "echo.config.json"), `{
+		"paths": {
+			"pagesDir": "src/pages"
+		}
+	}`)
+
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Paths.PagesDir != "src/pages" {
+		t.Errorf("pagesDir = %q, want %q", cfg.Paths.PagesDir, "src/pages")
+	}
+	if cfg.Paths.PublicDir != "public" {
+		t.Errorf("publicDir = %q, want %q", cfg.Paths.PublicDir, "public")
 	}
 }
 

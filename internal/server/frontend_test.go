@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/echo-ssr/echo/internal/config"
 	"github.com/echo-ssr/echo/internal/frontend"
 	"github.com/echo-ssr/echo/internal/loader"
 	"github.com/echo-ssr/echo/internal/nodeproc"
@@ -514,6 +515,75 @@ func TestHandleLoaderDataReturnsJSONFromGoLoader(t *testing.T) {
 	// URL should be rewritten to the original page path, not /_echo/data/...
 	if got["path"] != "/blog/42" {
 		t.Errorf("path = %q, want /blog/42 (URL should be rewritten)", got["path"])
+	}
+}
+
+func TestHandlePageStripsConfiguredBasePathBeforeFrontendRender(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeFrontendEngine{}
+	s := &Server{
+		appDir:      t.TempDir(),
+		cfg:         config.Config{BasePath: "/admin"},
+		devMode:     true,
+		logger:      discardLogger(),
+		goLoaders:   map[string]LoaderFunc{},
+		jsLoaders:   map[string]*loader.Loader{},
+		frontend:    fake,
+		frontendSSR: "src/entry-server.tsx",
+	}
+	page := compiledPage{
+		route: router.Route{
+			Pattern:   "/products",
+			BundleKey: "products",
+		},
+		shell: "<html><body><div id=\"app\"></div></body></html>",
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/products?x=1", nil)
+	rec := httptest.NewRecorder()
+	s.handlePage(rec, req, page, http.StatusOK)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if fake.lastRenderOptions.URL != "/products?x=1" {
+		t.Fatalf("url = %q, want %q", fake.lastRenderOptions.URL, "/products?x=1")
+	}
+}
+
+func TestHandleLoaderDataStripsConfiguredBasePath(t *testing.T) {
+	t.Parallel()
+
+	s := &Server{
+		appDir:    t.TempDir(),
+		logger:    discardLogger(),
+		cfg:       config.Config{BasePath: "/admin"},
+		goLoaders: map[string]LoaderFunc{},
+		jsLoaders: map[string]*loader.Loader{},
+	}
+	s.goLoaders["/blog/{id}"] = func(r *http.Request) (any, error) {
+		return map[string]string{"path": r.URL.Path}, nil
+	}
+
+	page := compiledPage{
+		route: router.Route{Pattern: "/blog/{id}", BundleKey: "blog/[id]"},
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/_echo/data/blog/42?x=1", nil)
+	req.SetPathValue("id", "42")
+	rec := httptest.NewRecorder()
+	s.handleLoaderData(rec, req, page)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var got map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got["path"] != "/blog/42" {
+		t.Errorf("path = %q, want /blog/42", got["path"])
 	}
 }
 

@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"strings"
 
 	esbuild "github.com/evanw/esbuild/pkg/api"
 
@@ -18,9 +20,22 @@ import (
 // ---------------------------------------------------------------------------
 
 type Config struct {
-	Port    int               `json:"port"`
-	Headers map[string]string `json:"headers"`
-	JS      JSTimeouts        `json:"js"`
+	Port     int               `json:"port"`
+	BasePath string            `json:"basePath"`
+	Headers  map[string]string `json:"headers"`
+	Paths    PathsConfig       `json:"paths"`
+	Frontend FrontendConfig    `json:"frontend"`
+	JS       JSTimeouts        `json:"js"`
+}
+
+type PathsConfig struct {
+	PagesDir  string `json:"pagesDir"`
+	PublicDir string `json:"publicDir"`
+}
+
+type FrontendConfig struct {
+	ClientEntry string `json:"clientEntry"`
+	SSREntry    string `json:"ssrEntry"`
 }
 
 type JSTimeouts struct {
@@ -109,6 +124,11 @@ func Defaults() Config {
 	return Config{
 		Port:    3000,
 		Headers: map[string]string{},
+		Paths: PathsConfig{
+			PagesDir:  "pages",
+			PublicDir: "public",
+		},
+		Frontend: FrontendConfig{},
 		JS: JSTimeouts{
 			LoaderTimeoutMs: 10000,
 			APITimeoutMs:    10000,
@@ -122,8 +142,15 @@ func (c *Config) applyDefaults() {
 	if c.Port <= 0 {
 		c.Port = def.Port
 	}
+	c.BasePath = NormalizeBasePath(c.BasePath)
 	if c.Headers == nil {
 		c.Headers = map[string]string{}
+	}
+	if c.Paths.PagesDir == "" {
+		c.Paths.PagesDir = def.Paths.PagesDir
+	}
+	if c.Paths.PublicDir == "" {
+		c.Paths.PublicDir = def.Paths.PublicDir
 	}
 	if c.JS.LoaderTimeoutMs <= 0 {
 		c.JS.LoaderTimeoutMs = def.JS.LoaderTimeoutMs
@@ -134,4 +161,19 @@ func (c *Config) applyDefaults() {
 	if c.JS.PathsTimeoutMs <= 0 {
 		c.JS.PathsTimeoutMs = def.JS.PathsTimeoutMs
 	}
+}
+
+func NormalizeBasePath(basePath string) string {
+	basePath = strings.TrimSpace(basePath)
+	if basePath == "" {
+		return ""
+	}
+	if !strings.HasPrefix(basePath, "/") {
+		basePath = "/" + basePath
+	}
+	cleaned := path.Clean(basePath)
+	if cleaned == "." || cleaned == "/" {
+		return ""
+	}
+	return cleaned
 }

@@ -96,8 +96,29 @@ func TestEchoCLIInitScaffoldsReactViteDefaults(t *testing.T) {
 
 	mustContainFile(t, filepath.Join(appDir, "src", "entry-server.tsx"), "export async function render")
 	mustContainFile(t, filepath.Join(appDir, "vite.config.ts"), "@vitejs/plugin-react")
+	mustContainFile(t, filepath.Join(appDir, "plugins", "echo-pages.ts"), "echoConfig.paths?.pagesDir || \"pages\"")
 	mustContainFile(t, filepath.Join(appDir, "package.json"), "\"vite\"")
 	mustContainFile(t, filepath.Join(appDir, "index.html"), "src=\"/src/main.ts\"")
+	if !strings.Contains(out, "npm install") {
+		t.Fatalf("expected default npm install hint, got:\n%s", out)
+	}
+}
+
+func TestEchoCLIInitPrefersDetectedPackageManager(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	appDir := filepath.Join(root, "my-app")
+	out, exit := runEchoHelperProcess(t, root, []string{
+		helperEnvKey + "=1",
+		"npm_config_user_agent=pnpm/10.0.0 node/v22.0.0",
+	}, "echo", "init", appDir)
+	if exit != 0 {
+		t.Fatalf("expected init to succeed, got exit %d:\n%s", exit, out)
+	}
+	if !strings.Contains(out, "pnpm install") {
+		t.Fatalf("expected pnpm install hint, got:\n%s", out)
+	}
 }
 
 func TestEchoCLIHelperProcess(t *testing.T) {

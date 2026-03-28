@@ -300,7 +300,7 @@ func TestFindClientEntry(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(dir, name), []byte("export function mount(){}"), 0o644); err != nil {
 				t.Fatal(err)
 			}
-			got, err := findClientEntry(dir)
+			got, err := findClientEntry(dir, "")
 			if err != nil {
 				t.Fatalf("findClientEntry: %v", err)
 			}
@@ -313,7 +313,7 @@ func TestFindClientEntry(t *testing.T) {
 	t.Run("missing client returns error", func(t *testing.T) {
 		t.Parallel()
 		dir := t.TempDir()
-		_, err := findClientEntry(dir)
+		_, err := findClientEntry(dir, "")
 		if err == nil {
 			t.Fatal("expected error for missing client adapter")
 		}
@@ -328,7 +328,7 @@ func TestFindClientEntry(t *testing.T) {
 		if err := os.MkdirAll(filepath.Join(dir, "client.tsx"), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		_, err := findClientEntry(dir)
+		_, err := findClientEntry(dir, "")
 		if err == nil {
 			t.Error("expected error — client.tsx is a directory, not a file")
 		}
@@ -342,12 +342,42 @@ func TestFindClientEntry(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		got, err := findClientEntry(dir)
+		got, err := findClientEntry(dir, "")
 		if err != nil {
 			t.Fatalf("findClientEntry: %v", err)
 		}
 		if !strings.HasSuffix(got, "client.tsx") {
 			t.Errorf("expected client.tsx to win, got %q", got)
+		}
+	})
+
+	t.Run("uses configured client entry", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(dir, "src"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "src", "client-entry.ts"), []byte("export function mount(){}"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		got, err := findClientEntry(dir, "src/client-entry.ts")
+		if err != nil {
+			t.Fatalf("findClientEntry: %v", err)
+		}
+		if !strings.HasSuffix(got, "src/client-entry.ts") {
+			t.Errorf("expected configured client entry, got %q", got)
+		}
+	})
+
+	t.Run("configured missing client entry returns error", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		_, err := findClientEntry(dir, "src/client-entry.ts")
+		if err == nil {
+			t.Fatal("expected error for missing configured client entry")
+		}
+		if !strings.Contains(err.Error(), "configured client entry") {
+			t.Errorf("unexpected error: %v", err)
 		}
 	})
 }

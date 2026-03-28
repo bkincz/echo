@@ -687,6 +687,18 @@ func TestGzipMiddleware(t *testing.T) {
 			t.Error("SSE path should not be gzip-compressed")
 		}
 	})
+
+	t.Run("prefixed SSE path skipped even with Accept-Encoding", func(t *testing.T) {
+		t.Parallel()
+		h := gzipMiddlewareWithBasePath("/admin")(inner)
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/admin/_echo/sse", nil)
+		req.Header.Set("Accept-Encoding", "gzip")
+		h.ServeHTTP(rec, req)
+		if enc := rec.Header().Get("Content-Encoding"); enc == "gzip" {
+			t.Error("prefixed SSE path should not be gzip-compressed")
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -790,6 +802,36 @@ func TestCreateStaticHandler_ServesPublicFile(t *testing.T) {
 	h := s.createStaticHandler(nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/logo.txt", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if body := rec.Body.String(); body != "hello" {
+		t.Fatalf("body = %q, want %q", body, "hello")
+	}
+}
+
+func TestCreateStaticHandler_StripsConfiguredBasePath(t *testing.T) {
+	t.Parallel()
+
+	appDir := t.TempDir()
+	publicDir := filepath.Join(appDir, "public")
+	if err := os.MkdirAll(publicDir, 0o755); err != nil {
+		t.Fatalf("mkdir public: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(publicDir, "logo.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatalf("write logo: %v", err)
+	}
+
+	s := &Server{
+		appDir:  appDir,
+		devMode: true,
+		cfg:     config.Config{BasePath: "/admin"},
+	}
+
+	h := s.createStaticHandler(nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/admin/logo.txt", nil))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)

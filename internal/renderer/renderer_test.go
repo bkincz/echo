@@ -140,12 +140,13 @@ func TestShellDevMode(t *testing.T) {
 		t.Parallel()
 		html, err := Shell(ShellOptions{
 			BundleURL: "/_echo/bundle/abc.js",
+			SSEURL:    "/admin/_echo/sse",
 			DevMode:   true,
 		})
 		if err != nil {
 			t.Fatalf("Shell: %v", err)
 		}
-		if !strings.Contains(html, "/_echo/sse") {
+		if !strings.Contains(html, "/admin/_echo/sse") {
 			t.Error("expected SSE endpoint reference in dev mode output")
 		}
 		if !strings.Contains(html, "EventSource") {

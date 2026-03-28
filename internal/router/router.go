@@ -23,6 +23,58 @@ type Route struct {
 	BundleKey string
 }
 
+var pageExts = []string{".tsx", ".ts", ".jsx", ".js"}
+
+func HasPageExt(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	for _, candidate := range pageExts {
+		if ext == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func IsLayoutFile(path string) bool {
+	base := filepath.Base(path)
+	for _, ext := range pageExts {
+		if base == "_layout"+ext {
+			return true
+		}
+	}
+	return false
+}
+
+func IsRoutablePageFile(path string) bool {
+	rel := filepath.ToSlash(path)
+	base := filepath.Base(rel)
+	baseNoExt := strings.TrimSuffix(base, filepath.Ext(base))
+
+	if !HasPageExt(base) || IsLayoutFile(base) {
+		return false
+	}
+	if strings.HasPrefix(rel, "api/") {
+		return false
+	}
+	if strings.HasPrefix(baseNoExt, "_") {
+		return false
+	}
+	if strings.Contains(base, ".loader.") || strings.Contains(base, ".meta.") || strings.Contains(base, ".d.") {
+		return false
+	}
+	return true
+}
+
+func BundleKeyForFile(path string) string {
+	rel := filepath.ToSlash(path)
+	return strings.TrimSuffix(rel, filepath.Ext(rel))
+}
+
+func IsErrorPageFile(path string) bool {
+	base := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	return base == "404" || base == "500"
+}
+
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
@@ -37,30 +89,16 @@ func Scan(pagesDir string) ([]Route, error) {
 			return nil
 		}
 
-		ext := filepath.Ext(path)
-		switch ext {
-		case ".tsx", ".ts", ".jsx", ".js":
-		default:
-			return nil
-		}
-
 		rel, err := filepath.Rel(pagesDir, path)
 		if err != nil {
 			return err
 		}
 		rel = filepath.ToSlash(rel)
-
-		base := filepath.Base(path)
-		for _, lext := range []string{".tsx", ".ts", ".jsx", ".js"} {
-			if base == "_layout"+lext {
-				return nil
-			}
-		}
-		if strings.HasPrefix(rel, "api/") {
+		if !IsRoutablePageFile(rel) {
 			return nil
 		}
 
-		bundleKey := strings.TrimSuffix(rel, ext)
+		bundleKey := BundleKeyForFile(rel)
 		pattern, err := fileToPattern(rel)
 		if err != nil {
 			return fmt.Errorf("invalid route %q: %w", rel, err)

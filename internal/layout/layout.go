@@ -3,7 +3,8 @@ package layout
 import (
 	"os"
 	"path/filepath"
-	"strings"
+
+	"github.com/echo-ssr/echo/internal/router"
 )
 
 // Find scans pagesDir for _layout.{tsx,ts,jsx,js} files and returns a map
@@ -43,13 +44,7 @@ func Find(pagesDir string) (map[string][]string, error) {
 }
 
 func IsLayoutFile(path string) bool {
-	base := filepath.Base(path)
-	for _, ext := range []string{".tsx", ".ts", ".jsx", ".js"} {
-		if base == "_layout"+ext {
-			return true
-		}
-	}
-	return false
+	return router.IsLayoutFile(path)
 }
 
 // ---------------------------------------------------------------------------
@@ -81,24 +76,17 @@ func scanLayouts(pagesDir string) (map[string]string, error) {
 }
 
 func scanPageKeys(pagesDir string) ([]string, error) {
-	pageExts := map[string]bool{".tsx": true, ".ts": true, ".jsx": true, ".js": true}
 	var keys []string
 	err := filepath.WalkDir(pagesDir, func(path string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return err
 		}
-		name := d.Name()
-		if IsLayoutFile(path) {
-			return nil
-		}
-		ext := filepath.Ext(name)
-		if !pageExts[ext] {
-			return nil
-		}
 		rel, _ := filepath.Rel(pagesDir, path)
 		rel = filepath.ToSlash(rel)
-		key := strings.TrimSuffix(rel, ext)
-		keys = append(keys, key)
+		if !router.IsRoutablePageFile(rel) {
+			return nil
+		}
+		keys = append(keys, router.BundleKeyForFile(rel))
 		return nil
 	})
 	return keys, err

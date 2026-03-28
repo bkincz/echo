@@ -90,6 +90,33 @@ func parseInitArgs(args []string) (dir string, node bool) {
 	return
 }
 
+func preferredPackageManager() string {
+	ua := strings.ToLower(os.Getenv("npm_config_user_agent"))
+	switch {
+	case strings.HasPrefix(ua, "pnpm/"):
+		return "pnpm"
+	case strings.HasPrefix(ua, "yarn/"):
+		return "yarn"
+	case strings.HasPrefix(ua, "bun/"):
+		return "bun"
+	default:
+		return "npm"
+	}
+}
+
+func installCommand(pm string) string {
+	switch pm {
+	case "pnpm":
+		return "pnpm install"
+	case "yarn":
+		return "yarn"
+	case "bun":
+		return "bun install"
+	default:
+		return "npm install"
+	}
+}
+
 func runServer(appDir string, devMode bool) {
 	requireNode()
 
@@ -152,49 +179,6 @@ var reactTemplate = map[string]string{
 import { createElement } from "react";
 import type { ComponentType, FC, ReactNode } from "react";
 
-// pages is auto-generated from your pages/ directory by Echo's Vite plugin.
-// Each entry exposes the page component and its layout chain so you can wire
-// up any client-side router you like (React Router, TanStack Router, wouter…).
-//
-// echoPatternToPath converts Echo patterns to :param-style router paths:
-//   /blog/{id}       → /blog/:id
-//   /files/{slug...} → /files/*
-//
-// /_echo/data/<path> is a JSON endpoint for each route's loader data —
-// call it from your router's loader function on client-side navigation.
-//
-// Example with React Router v7:
-//
-//   import { createBrowserRouter, RouterProvider, useLoaderData } from "react-router-dom";
-//   import { pages, echoPatternToPath } from "virtual:echo-pages";
-//
-//   const router = createBrowserRouter(
-//     Object.entries(pages).map(([pattern, { load, layouts }], idx) => ({
-//       id: String(idx),
-//       path: echoPatternToPath(pattern),
-//       lazy: async () => {
-//         const [page, ...ls] = await Promise.all([load(), ...layouts.map(l => l())]);
-//         const Page = page.default;
-//         function Route() {
-//           const data = useLoaderData();
-//           let node = createElement(Page, { loaderData: data });
-//           for (let i = ls.length - 1; i >= 0; i--)
-//             if (ls[i].default) node = createElement(ls[i].default, null, node);
-//           return node;
-//         }
-//         return { Component: Route };
-//       },
-//       loader: async ({ request }) => {
-//         const url = new URL(request.url);
-//         const res = await fetch("/_echo/data" + url.pathname + url.search);
-//         return res.ok ? res.json() : null;
-//       },
-//     }))
-//   );
-//
-//   export function mount(root: Element) {
-//     hydrateRoot(root, createElement(RouterProvider, { router }));
-//   }
 
 type PageModule = { default?: ComponentType<any> };
 type LayoutModule = { default?: FC<{ children: ReactNode }> };
@@ -317,8 +301,6 @@ function buildShellParts(shell: string, loaderData: unknown) {
   return { shellHead, shellTail };
 }
 
-// buildApp loads the page and its layout chain, returning a React element tree
-// with layouts wrapping the page (outermost layout first).
 async function buildApp(routePattern: string, loaderData: unknown) {
   const entry = pages[routePattern];
   if (!entry) return null;
@@ -333,10 +315,6 @@ async function buildApp(routePattern: string, loaderData: unknown) {
   return node;
 }
 
-// renderStream uses renderToPipeableStream for true streaming SSR.
-// React emits the shell immediately then fills Suspense boundaries as async
-// data resolves. The Go server pipes each chunk straight to the HTTP response
-// so the browser starts rendering before the full page is ready.
 export async function renderStream(ctx: RenderContext): Promise<Readable> {
   const parts = buildShellParts(ctx.shell, ctx.loaderData);
   const app = await buildApp(ctx.routePattern, ctx.loaderData);
@@ -353,8 +331,6 @@ export async function renderStream(ctx: RenderContext): Promise<Readable> {
   const { pipe } = renderToPipeableStream(app, {
     onShellReady() {
       output.write(shellHead);
-      // Transform appends shellTail in flush(), which runs after React calls
-      // wrap.end() — i.e. after all content including deferred Suspense fills.
       const wrap = new Transform({
         transform(chunk, _enc, cb) { this.push(chunk); cb(); },
         flush(cb) { this.push(shellTail); cb(); },
@@ -373,7 +349,6 @@ export async function renderStream(ctx: RenderContext): Promise<Readable> {
   return output;
 }
 
-// render is the non-streaming fallback used by static builds and error pages.
 export async function render(ctx: RenderContext): Promise<string> {
   const app = await buildApp(ctx.routePattern, ctx.loaderData);
   const appHtml = app ? renderToString(app) : "";
@@ -400,29 +375,67 @@ declare module "virtual:echo-pages" {
   type PageLoad = () => Promise<{ default: ComponentType<any> }>;
   type LayoutLoad = () => Promise<{ default: FC<{ children: ReactNode }> }>;
 
-  /** All page routes keyed by Echo pattern (e.g. "/blog/{id}"). */
   export const pages: Record<string, { load: PageLoad; layouts: LayoutLoad[] }>;
+  export const echoBasePath: string;
+  export function echoWithBasePath(path: string): string;
+  export function echoDataPath(pathname: string, search?: string): string;
 
-  /**
-   * Convert an Echo route pattern to a :param-style path for most routers.
-   *   /blog/{id}       → /blog/:id
-   *   /files/{slug...} → /files/*
-   */
   export function echoPatternToPath(pattern: string): string;
 }
 `,
-	"plugins/echo-pages.ts": `import type { Plugin } from "vite";
+	"plugins/echo-pages.ts": `import { Buffer } from "node:buffer";
 import fs from "node:fs";
 import path from "node:path";
+import { transformWithEsbuild, type Plugin } from "vite";
 
 const VIRTUAL_ID = "virtual:echo-pages";
 const RESOLVED_ID = "\0" + VIRTUAL_ID;
 
 const PAGE_EXTS = /\.(tsx|jsx|ts|js)$/;
 const LAYOUT_EXTS = [".tsx", ".jsx", ".ts", ".js"];
-// Skip _layout, .loader, .meta, .d files and server-side error pages
 const SKIP_PATTERN = /^_|\.loader\.|\.meta\.|\.d\./;
 const ERROR_PAGES = /^(404|500)\./;
+
+function normalizeBasePath(basePath: unknown): string {
+  if (typeof basePath !== "string") return "";
+  const trimmed = basePath.trim();
+  if (!trimmed) return "";
+  const normalized = path.posix.normalize(trimmed.startsWith("/") ? trimmed : "/" + trimmed);
+  return normalized === "/" ? "" : normalized.replace(/\/+$/, "");
+}
+
+type EchoConfig = {
+  basePath?: string;
+  paths?: { pagesDir?: string };
+};
+
+async function loadEchoConfig(root: string): Promise<EchoConfig> {
+  const tsPath = path.join(root, "echo.config.ts");
+  if (fs.existsSync(tsPath)) {
+    try {
+      const source = fs.readFileSync(tsPath, "utf8");
+      const result = await transformWithEsbuild(source, tsPath, {
+        loader: "ts",
+        format: "esm",
+        target: "esnext",
+        sourcemap: false,
+      });
+      const mod = await import(
+        "data:text/javascript;base64," + Buffer.from(result.code).toString("base64")
+      );
+      return (mod.default ?? mod) as EchoConfig;
+    } catch {
+      return {};
+    }
+  }
+
+  const jsonPath = path.join(root, "echo.config.json");
+  try {
+    return JSON.parse(fs.readFileSync(jsonPath, "utf8"));
+  } catch {
+    return {};
+  }
+}
 
 function segmentToPattern(seg: string): string {
   if (seg.startsWith("[...") && seg.endsWith("]")) return "{" + seg.slice(4, -1) + "...}";
@@ -438,8 +451,6 @@ function fileToRoute(rel: string): string {
   return joined === "" ? "/" : "/" + joined;
 }
 
-// Returns _layout.* import paths (relative to pagesDir root) for a page file,
-// ordered root-first so the outermost layout wraps first.
 function findLayouts(pagesDir: string, relPage: string): string[] {
   const dir = path.dirname(relPage);
   const parts = dir === "." ? [] : dir.split("/");
@@ -487,12 +498,15 @@ function scanDir(pagesDir: string, dir: string, base = ""): Array<[string, strin
 
 export function echoPages(): Plugin {
   let pagesDir = "";
+  let basePath = "";
 
   return {
     name: "echo-pages",
 
-    configResolved(config) {
-      pagesDir = path.join(config.root, "pages");
+    async configResolved(config) {
+      const echoConfig = await loadEchoConfig(config.root);
+      pagesDir = path.join(config.root, echoConfig.paths?.pagesDir || "pages");
+      basePath = normalizeBasePath(echoConfig.basePath);
     },
 
     resolveId(id) {
@@ -514,9 +528,20 @@ export function echoPages(): Plugin {
         );
       });
       const patternUtil = [
-        "// Convert an Echo route pattern to a :param-style router path.",
-        "//   /blog/{id}       → /blog/:id",
-        "//   /files/{slug...} → /files/*",
+        "export const echoBasePath = " + JSON.stringify(basePath) + ";",
+        "",
+        "export function echoWithBasePath(path) {",
+        '  if (!path) path = "/";',
+        '  if (!path.startsWith("/")) path = "/" + path;',
+        "  if (!echoBasePath) return path;",
+        '  return path === "/" ? echoBasePath : echoBasePath + path;',
+        "}",
+        "",
+        'export function echoDataPath(pathname, search = "") {',
+        '  const dataPath = pathname === "/" ? "/_echo/data/" : "/_echo/data" + pathname;',
+        '  return echoWithBasePath(dataPath) + (search || "");',
+        "}",
+        "",
         "export function echoPatternToPath(pattern) {",
         "  return pattern",
         '    .replace(/\\{([^}]+)\\.\\.\\.\\}/g, "*")',
@@ -635,6 +660,6 @@ func runInit(dir string, node bool) {
 	if node {
 		variant += " + node"
 	}
-	fmt.Printf("Echo app created in %s/ (%s)\n\nNext steps:\n  cd %s\n  npm install\n  echo dev .\n",
-		dir, variant, dir)
+	fmt.Printf("Echo app created in %s/ (%s)\n\nNext steps:\n  cd %s\n  %s\n  echo dev .\n",
+		dir, variant, dir, installCommand(preferredPackageManager()))
 }

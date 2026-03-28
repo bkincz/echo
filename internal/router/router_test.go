@@ -71,6 +71,9 @@ func TestScanHappyPath(t *testing.T) {
 	mustWriteFile(t, filepath.Join(pagesDir, "blog", "[id].tsx"), "")
 	mustWriteFile(t, filepath.Join(pagesDir, "docs", "[...slug].tsx"), "")
 	mustWriteFile(t, filepath.Join(pagesDir, "404.tsx"), "")
+	mustWriteFile(t, filepath.Join(pagesDir, "index.loader.ts"), "")
+	mustWriteFile(t, filepath.Join(pagesDir, "_private.tsx"), "")
+	mustWriteFile(t, filepath.Join(pagesDir, "types.d.ts"), "")
 	mustWriteFile(t, filepath.Join(pagesDir, "README.md"), "")
 
 	routes, err := Scan(pagesDir)
@@ -99,6 +102,33 @@ func TestScanHappyPath(t *testing.T) {
 		}
 		if r.FilePath == "" {
 			t.Errorf("pattern %q: FilePath is empty", r.Pattern)
+		}
+	}
+}
+
+func TestIsRoutablePageFile(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		path string
+		want bool
+	}{
+		{"index.tsx", true},
+		{"blog/[id].tsx", true},
+		{"404.tsx", true},
+		{"500.tsx", true},
+		{"_layout.tsx", false},
+		{"_private.tsx", false},
+		{"index.loader.ts", false},
+		{"page.meta.ts", false},
+		{"types.d.ts", false},
+		{"api/users.ts", false},
+		{"README.md", false},
+	}
+
+	for _, tc := range cases {
+		if got := IsRoutablePageFile(tc.path); got != tc.want {
+			t.Errorf("IsRoutablePageFile(%q) = %v, want %v", tc.path, got, tc.want)
 		}
 	}
 }

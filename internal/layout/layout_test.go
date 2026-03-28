@@ -63,6 +63,32 @@ func TestFindNestedLayouts(t *testing.T) {
 	}
 }
 
+func TestFindSkipsNonPageCompanions(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	touch(t, filepath.Join(dir, "_layout.tsx"))
+	touch(t, filepath.Join(dir, "index.tsx"))
+	touch(t, filepath.Join(dir, "index.loader.ts"))
+	touch(t, filepath.Join(dir, "_private.tsx"))
+	touch(t, filepath.Join(dir, "types.d.ts"))
+
+	got, err := Find(dir)
+	if err != nil {
+		t.Fatalf("Find: %v", err)
+	}
+
+	if _, ok := got["index.loader"]; ok {
+		t.Fatalf("loader sidecar should not receive a layout chain: %v", got)
+	}
+	if _, ok := got["_private"]; ok {
+		t.Fatalf("underscore-prefixed files should not receive a layout chain: %v", got)
+	}
+	if len(got["index"]) != 1 {
+		t.Fatalf("index: want root layout chain, got %v", got["index"])
+	}
+}
+
 func TestIsLayoutFile(t *testing.T) {
 	t.Parallel()
 	cases := []struct {

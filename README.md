@@ -25,21 +25,23 @@ Open `http://localhost:3000`. Add `--node` to include JS loader and API route su
 echo init my-app --node
 ```
 
+`pnpm install`, `yarn`, and `bun install` work too.
+
 ---
 
 ## Features
 
 - File-based routing from a `pages/` directory
 - Nested layouts via `_layout.tsx`
-- Server-side data loading — Go functions or JS loader files
+- Server-side data loading via Go functions or JS loader files
 - JS API routes under `pages/api/`
-- Streaming SSR via `renderToPipeableStream` — Suspense boundaries resolve as data arrives
+- Streaming SSR via `renderToPipeableStream`. Suspense boundaries resolve as data arrives
 - Hot reload in dev with browser error overlay
 - Per-page `title` / `description` via `.meta.json` sidecars
 - CSS and CSS Modules out of the box. Including Lightning CSS as optional
 - Static site generation (`echo build --static`)
 - Custom middleware, headers, and esbuild plugins
-- Health endpoint at `/_echo/health`
+- Health endpoint at `<basePath>/_echo/health`
 
 ---
 
@@ -47,7 +49,7 @@ echo init my-app --node
 
 ```
 my-app/
-  client.tsx              # Client mount function (hydration entry)
+  client.tsx              # Default client mount function (hydration entry)
   src/
     entry-server.tsx      # SSR render function
   pages/
@@ -67,6 +69,21 @@ my-app/
   echo.config.json
   vite.config.ts
   package.json
+```
+
+For a more Vite-native layout, move the app under `src/` and point Echo at it:
+
+```json
+{
+  "paths": {
+    "pagesDir": "src/pages",
+    "publicDir": "public"
+  },
+  "frontend": {
+    "clientEntry": "src/client.tsx",
+    "ssrEntry": "src/entry-server.tsx"
+  }
+}
 ```
 
 ---
@@ -102,7 +119,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
 }
 ```
 
-Layouts nest automatically — a `pages/blog/_layout.tsx` wraps inside the root layout.
+Layouts nest automatically. A `pages/blog/_layout.tsx` wraps inside the root layout.
 
 ---
 
@@ -157,56 +174,16 @@ export async function handler(req) {
 
 ## Client-Side Routing
 
-Echo ships the infrastructure — you choose the router.
-
-**`virtual:echo-pages`** is a generated module that maps every route to its page and layout chain:
+Use any client router you want. Echo exposes:
 
 ```ts
-import { pages, echoPatternToPath } from "virtual:echo-pages";
-
-// pages["/{id}"] = { load: () => import("..."), layouts: [() => import("...")] }
-// echoPatternToPath("/blog/{id}") → "/blog/:id"
-// echoPatternToPath("/files/{slug...}") → "/files/*"
+import { pages, echoBasePath, echoDataPath, echoPatternToPath } from "virtual:echo-pages";
 ```
 
-**`GET /_echo/data/<path>`** runs the route's loader and returns JSON — call it from your router's loader function on client-side navigation.
-
-Example wiring with React Router v7 (add `react-router-dom` yourself):
-
-```tsx
-// client.tsx
-import { createBrowserRouter, RouterProvider, useLoaderData } from "react-router-dom";
-import { pages, echoPatternToPath } from "virtual:echo-pages";
-
-const router = createBrowserRouter(
-  Object.entries(pages).map(([pattern, { load, layouts }], idx) => ({
-    id: String(idx),
-    path: echoPatternToPath(pattern),
-    lazy: async () => {
-      const [page, ...ls] = await Promise.all([load(), ...layouts.map(l => l())]);
-      function Route() {
-        const data = useLoaderData();
-        let node = <page.default loaderData={data} />;
-        for (let i = ls.length - 1; i >= 0; i--)
-          if (ls[i].default) node = <ls[i].default>{node}</ls[i].default>;
-        return node;
-      }
-      return { Component: Route };
-    },
-    loader: async ({ request }) => {
-      const url = new URL(request.url);
-      const res = await fetch("/_echo/data" + url.pathname + url.search);
-      return res.ok ? res.json() : null;
-    },
-  }))
-);
-
-export function mount(root: Element) {
-  hydrateRoot(root, <RouterProvider router={router} />);
-}
-```
-
-The scaffolded `client.tsx` ships a simpler `mount(root, layouts, page)` for single-page SSR hydration with a comment showing the above pattern.
+- `pages`: route modules and layout chains keyed by Echo route pattern
+- `echoPatternToPath()`: converts Echo patterns to router paths
+- `echoDataPath()`: builds the loader-data URL for client navigation
+- `echoBasePath`: use as your router basename when mounting under a prefix
 
 ---
 
@@ -219,13 +196,13 @@ import "./page.css";
 import styles from "./hero.module.css";
 ```
 
-For autoprefixing, nesting, and modern color functions, install [Lightning CSS](https://lightningcss.dev) — Echo picks it up automatically:
+For autoprefixing, nesting, and modern color functions, install [Lightning CSS](https://lightningcss.dev). Echo picks it up automatically:
 
 ```bash
 npm install --save-dev lightningcss
 ```
 
-For SCSS or other preprocessors, configure them in `vite.config.ts` as you normally would.
+For SCSS or other preprocessors, configure them in `vite.config.ts`.
 
 ---
 
@@ -236,6 +213,15 @@ For SCSS or other preprocessors, configure them in `vite.config.ts` as you norma
 ```json
 {
   "port": 3000,
+  "basePath": "/admin",
+  "paths": {
+    "pagesDir": "pages",
+    "publicDir": "public"
+  },
+  "frontend": {
+    "clientEntry": "client.tsx",
+    "ssrEntry": "src/entry-server.tsx"
+  },
   "headers": {
     "Content-Security-Policy": "default-src 'self'"
   },
@@ -247,7 +233,9 @@ For SCSS or other preprocessors, configure them in `vite.config.ts` as you norma
 }
 ```
 
-`PORT` env var overrides the configured port. Echo sets `X-Content-Type-Options`, `X-Frame-Options`, and `Referrer-Policy` by default — use `headers` to override them.
+`basePath`, `paths.pagesDir`, `paths.publicDir`, `frontend.clientEntry`, and `frontend.ssrEntry` are optional.
+
+`PORT` env var overrides the configured port. Echo sets `X-Content-Type-Options`, `X-Frame-Options`, and `Referrer-Policy` by default. Use `headers` to override them.
 
 ---
 

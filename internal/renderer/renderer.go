@@ -13,6 +13,7 @@ type ShellOptions struct {
 	Description  string
 	BundleURL    string
 	CSSBundleURL string
+	SSEURL       string
 	DevMode      bool
 }
 
@@ -43,7 +44,7 @@ var shellTmpl = template.Must(template.New("shell").Parse(`<!DOCTYPE html>
       overlay.style.cssText = "display:none;position:fixed;inset:0;background:#0d0d0d;color:#ff5555;font:14px/1.6 monospace;padding:32px;z-index:99999;white-space:pre-wrap;overflow:auto;";
       document.body.appendChild(overlay);
 
-      const es = new EventSource("/_echo/sse");
+      const es = new EventSource({{printf "%q" .SSEURL}});
       es.onmessage = () => { overlay.style.display = "none"; location.reload(); };
       es.addEventListener("build_error", (e) => {
         overlay.style.display = "block";
@@ -63,6 +64,9 @@ var shellTmpl = template.Must(template.New("shell").Parse(`<!DOCTYPE html>
 func Shell(opts ShellOptions) (string, error) {
 	if opts.Title == "" {
 		opts.Title = "Echo"
+	}
+	if opts.SSEURL == "" {
+		opts.SSEURL = "/_echo/sse"
 	}
 	var buf bytes.Buffer
 	if err := shellTmpl.Execute(&buf, opts); err != nil {

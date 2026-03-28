@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/echo-ssr/echo/internal/config"
 	"github.com/echo-ssr/echo/internal/jsruntime"
 	"github.com/echo-ssr/echo/internal/nodeproc"
 )
@@ -80,7 +81,7 @@ type workerRequest struct {
 }
 
 type workerMessage struct {
-	ID    string `json:"id"`
+	ID string `json:"id"`
 	// Streaming protocol (preferred)
 	Chunk string `json:"chunk,omitempty"`
 	Done  bool   `json:"done,omitempty"`
@@ -649,16 +650,20 @@ func resolveViteExecutable(appDir string) (string, error) {
 		return global, nil
 	}
 
-	return "", fmt.Errorf("vite not found. install it in app dependencies (npm i -D vite) or ensure it is available in PATH")
+	return "", fmt.Errorf("vite not found. install it in app dependencies (npm i -D vite, pnpm add -D vite, or bun add -d vite) or ensure it is available in PATH")
 }
 
 func findSSREntry(appDir string) string {
-	candidates := []string{
+	candidates := []string{}
+	if cfg, err := config.Load(appDir); err == nil && cfg.Frontend.SSREntry != "" {
+		candidates = append(candidates, filepath.ToSlash(cfg.Frontend.SSREntry))
+	}
+	candidates = append(candidates,
 		"src/entry-server.tsx",
 		"src/entry.server.tsx",
 		"entry-server.tsx",
 		"entry.server.tsx",
-	}
+	)
 	for _, rel := range candidates {
 		abs := filepath.Join(appDir, rel)
 		if info, err := os.Stat(abs); err == nil && !info.IsDir() {
